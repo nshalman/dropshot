@@ -13,6 +13,12 @@ use super::router::HttpRouter;
 use super::versioning::VersionPolicy;
 use super::ProbeRegistration;
 
+#[cfg(feature = "otel-tracing")]
+use crate::{
+    otel,
+    otel::TraceDropshot,
+};
+
 use async_stream::stream;
 use debug_ignore::DebugIgnore;
 use futures::future::{
@@ -246,6 +252,8 @@ impl<C: ServerContext> HttpServerStarter<C> {
             http_acceptor,
         } = self;
 
+        //XXX
+        //let _otel_guard = equinix_otel_tools::init("dropshot");
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
         let make_service = ServerConnectionHandler::new(Arc::clone(&app_state));
         let log = &app_state.log;
@@ -774,6 +782,18 @@ async fn http_request_handle_wrap<C: ServerContext>(
         }
     }
 
+    #[cfg(feature = "otel-tracing")]
+    let mut span = otel::create_request_span(&request);
+    #[cfg(feature = "otel-tracing")]
+    span.trace_request(crate::dtrace::RequestInfo {
+        id: request_id.clone(),
+        local_addr: server.local_addr,
+        remote_addr,
+        method: request.method().to_string(),
+        path: request.uri().path().to_string(),
+        query: request.uri().query().map(|x| x.to_string()),
+    });
+
     trace!(request_log, "incoming request");
     #[cfg(feature = "usdt-probes")]
     probes::request__start!(|| {
@@ -790,7 +810,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
 
     // Copy local address to report later during the finish probe, as the
     // server is passed by value to the request handler function.
-    #[cfg(feature = "usdt-probes")]
+    #[cfg_attr(any, feature = "usdt-probes", feature = "otel-tracing")]
     let local_addr = server.local_addr;
 
     // In the case the client disconnects early, the scopeguard allows us
@@ -801,6 +821,18 @@ async fn http_request_handle_wrap<C: ServerContext>(
         warn!(request_log, "request handling cancelled (client disconnected)";
             "latency_us" => latency_us,
         );
+
+        #[cfg(feature = "otel-tracing")]
+        span.trace_response(crate::dtrace::ResponseInfo {
+            id: request_id.clone(),
+            local_addr,
+            remote_addr,
+            // 499 is a non-standard code popularized by nginx to mean "client disconnected".
+            status_code: 499,
+            message: String::from(
+                "client disconnected before response returned",
+            ),
+        });
 
         #[cfg(feature = "usdt-probes")]
         probes::request__done!(|| {
@@ -838,6 +870,17 @@ async fn http_request_handle_wrap<C: ServerContext>(
                 let message_external = error.external_message();
                 let message_internal = error.internal_message();
 
+                #[cfg(feature = "otel-tracing")]
+                span.trace_response(crate::dtrace::ResponseInfo {
+                    id: request_id.clone(),
+                    local_addr,
+                    remote_addr,
+                    status_code: status.as_u16(),
+                    message: message_external
+                        .cloned()
+                        .unwrap_or_else(|| message_internal.clone()),
+                });
+
                 #[cfg(feature = "usdt-probes")]
                 probes::request__done!(|| {
                     crate::dtrace::ResponseInfo {
@@ -869,6 +912,15 @@ async fn http_request_handle_wrap<C: ServerContext>(
                 "latency_us" => latency_us,
             );
 
+            #[cfg(feature = "otel-tracing")]
+            span.trace_response(crate::dtrace::ResponseInfo {
+                id: request_id.parse().unwrap(),
+                local_addr,
+                remote_addr,
+                status_code: response.status().as_u16(),
+                message: "".to_string(),
+            });
+
             #[cfg(feature = "usdt-probes")]
             probes::request__done!(|| {
                 crate::dtrace::ResponseInfo {
@@ -887,6 +939,17 @@ async fn http_request_handle_wrap<C: ServerContext>(
     Ok(response)
 }
 
+#[cfg_attr(feature = "otel-tracing", tracing::instrument(
+    skip_all,
+    fields(
+        http.method = request.method().as_str().to_string(),
+        http.uri = request.uri().to_string(),
+        http.version = format!("{:#?}",request.version()),
+        http.headers.accept = format!("{:#?}", request.headers()["accept"]),
+        http.headers.host = format!("{:#?}", request.headers()["host"]),
+        http.headers.user_agent = format!("{:#?}", request.headers()["user-agent"]),
+    ),
+))]
 async fn http_request_handle<C: ServerContext>(
     server: Arc<DropshotState<C>>,
     request: Request<hyper::body::Incoming>,

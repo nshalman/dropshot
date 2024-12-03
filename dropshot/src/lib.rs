@@ -834,6 +834,7 @@ mod from_map;
 mod handler;
 mod http_util;
 mod logging;
+mod otel;
 mod pagination;
 mod router;
 mod schema_util;
