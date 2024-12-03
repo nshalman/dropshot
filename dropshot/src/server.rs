@@ -246,6 +246,7 @@ impl<C: ServerContext> HttpServerStarter<C> {
             http_acceptor,
         } = self;
 
+        let _otel_guard = equinix_otel_tools::init("dropshot");
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
         let make_service = ServerConnectionHandler::new(Arc::clone(&app_state));
         let log = &app_state.log;
@@ -884,6 +885,17 @@ async fn http_request_handle_wrap<C: ServerContext>(
     Ok(response)
 }
 
+#[tracing::instrument(
+    skip(server),
+    fields(
+        http.method = request.method().as_str().to_string(),
+        http.uri = request.uri().to_string(),
+        http.version = format!("{:#?}",request.version()),
+        http.headers.accept = format!("{:#?}", request.headers()["accept"]),
+        http.headers.host = format!("{:#?}", request.headers()["host"]),
+        http.headers.user_agent = format!("{:#?}", request.headers()["user-agent"]),
+    ),
+)]
 async fn http_request_handle<C: ServerContext>(
     server: Arc<DropshotState<C>>,
     request: Request<hyper::body::Incoming>,

@@ -47,6 +47,8 @@ thiserror = "2.0.3"
 tokio-rustls = "0.25.0"
 toml = "0.8.19"
 waitgroup = "0.1.2"
+equinix-otel-tools = { git = "https://github.com/nshalman/rust-otel-tools", rev = "cae47d6a0a891bc095a2d920e2bf2ccbda2be178" }
+tracing = "0.1"
 
 [dependencies.chrono]
 version = "0.4.38"
