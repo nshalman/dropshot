@@ -47,8 +47,11 @@ thiserror = "2.0.3"
 tokio-rustls = "0.25.0"
 toml = "0.8.19"
 waitgroup = "0.1.2"
-equinix-otel-tools = { git = "https://github.com/nshalman/rust-otel-tools", rev = "cae47d6a0a891bc095a2d920e2bf2ccbda2be178" }
-tracing = "0.1"
+
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry-http = { version = "0.27", features = ["hyper"], optional = true }
+opentelemetry-semantic-conventions = { version = "0.27", optional = true }
+tracing = { version = "0.1", optional = true }
 
 [dependencies.chrono]
 version = "0.4.38"
@@ -138,6 +141,7 @@ version_check = "0.9.5"
 [features]
 usdt-probes = ["usdt/asm"]
 internal-docs = ["simple-mermaid"]
+otel-tracing = ["opentelemetry", "opentelemetry-http", "opentelemetry-semantic-conventions", "tracing"]
 
 [package.metadata.docs.rs]
 features = ["internal-docs"]

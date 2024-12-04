@@ -12,6 +12,8 @@ use super::http_util::HEADER_REQUEST_ID;
 use super::router::HttpRouter;
 use super::versioning::VersionPolicy;
 use super::ProbeRegistration;
+#[cfg(feature = "otel-tracing")]
+use crate::otel;
 
 use async_stream::stream;
 use debug_ignore::DebugIgnore;
@@ -246,7 +248,6 @@ impl<C: ServerContext> HttpServerStarter<C> {
             http_acceptor,
         } = self;
 
-        let _otel_guard = equinix_otel_tools::init("dropshot");
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
         let make_service = ServerConnectionHandler::new(Arc::clone(&app_state));
         let log = &app_state.log;
@@ -775,6 +776,9 @@ async fn http_request_handle_wrap<C: ServerContext>(
         }
     }
 
+    #[cfg(feature = "otel-tracing")]
+    let mut span = otel::create_request_span(&request);
+
     trace!(request_log, "incoming request");
     #[cfg(feature = "usdt-probes")]
     probes::request__start!(|| {
@@ -803,6 +807,8 @@ async fn http_request_handle_wrap<C: ServerContext>(
             "latency_us" => latency_us,
         );
 
+        #[cfg(feature = "otel-tracing")]
+        otel::span_set_response_code(&mut span, 499);
         #[cfg(feature = "usdt-probes")]
         probes::request__done!(|| {
             crate::dtrace::ResponseInfo {
@@ -834,9 +840,15 @@ async fn http_request_handle_wrap<C: ServerContext>(
     let latency_us = start_time.elapsed().as_micros();
     let response = match maybe_response {
         Err(error) => {
+            #[cfg(feature = "otel-tracing")]
+            otel::span_record_error(&mut span, &error);
+
             let message_external = error.external_message.clone();
             let message_internal = error.internal_message.clone();
             let r = error.into_response(&request_id);
+
+            #[cfg(feature = "otel-tracing")]
+            otel::span_set_response_code(&mut span, r.status().as_u16());
 
             #[cfg(feature = "usdt-probes")]
             probes::request__done!(|| {
@@ -867,6 +879,9 @@ async fn http_request_handle_wrap<C: ServerContext>(
                 "latency_us" => latency_us,
             );
 
+            #[cfg(feature = "otel-tracing")]
+            otel::span_set_response_code(&mut span, response.status().as_u16());
+
             #[cfg(feature = "usdt-probes")]
             probes::request__done!(|| {
                 crate::dtrace::ResponseInfo {
@@ -885,8 +900,8 @@ async fn http_request_handle_wrap<C: ServerContext>(
     Ok(response)
 }
 
-#[tracing::instrument(
-    skip(server),
+#[cfg_attr(feature = "otel-tracing", tracing::instrument(
+    skip_all,
     fields(
         http.method = request.method().as_str().to_string(),
         http.uri = request.uri().to_string(),
@@ -895,7 +910,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
         http.headers.host = format!("{:#?}", request.headers()["host"]),
         http.headers.user_agent = format!("{:#?}", request.headers()["user-agent"]),
     ),
-)]
+))]
 async fn http_request_handle<C: ServerContext>(
     server: Arc<DropshotState<C>>,
     request: Request<hyper::body::Incoming>,
