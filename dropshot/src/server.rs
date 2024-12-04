@@ -12,8 +12,11 @@ use super::http_util::HEADER_REQUEST_ID;
 use super::router::HttpRouter;
 use super::versioning::VersionPolicy;
 use super::ProbeRegistration;
+
 #[cfg(feature = "otel-tracing")]
-use crate::otel;
+use opentelemetry::trace::Span;
+#[cfg(feature = "otel-tracing")]
+use crate::{otel, otel::TraceRequest};
 
 use async_stream::stream;
 use debug_ignore::DebugIgnore;
@@ -778,6 +781,8 @@ async fn http_request_handle_wrap<C: ServerContext>(
 
     #[cfg(feature = "otel-tracing")]
     let mut span = otel::create_request_span(&request);
+    #[cfg(feature = "otel-tracing")]
+    span.trace_request(&request);
 
     trace!(request_log, "incoming request");
     #[cfg(feature = "usdt-probes")]
@@ -808,7 +813,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
         );
 
         #[cfg(feature = "otel-tracing")]
-        otel::span_set_response_code(&mut span, 499);
+        span.trace_response(499);
         #[cfg(feature = "usdt-probes")]
         probes::request__done!(|| {
             crate::dtrace::ResponseInfo {
@@ -841,14 +846,14 @@ async fn http_request_handle_wrap<C: ServerContext>(
     let response = match maybe_response {
         Err(error) => {
             #[cfg(feature = "otel-tracing")]
-            otel::span_record_error(&mut span, &error);
+            span.record_error(&error);
 
             let message_external = error.external_message.clone();
             let message_internal = error.internal_message.clone();
             let r = error.into_response(&request_id);
 
             #[cfg(feature = "otel-tracing")]
-            otel::span_set_response_code(&mut span, r.status().as_u16());
+            span.trace_response(r.status().as_u16());
 
             #[cfg(feature = "usdt-probes")]
             probes::request__done!(|| {
@@ -880,7 +885,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
             );
 
             #[cfg(feature = "otel-tracing")]
-            otel::span_set_response_code(&mut span, response.status().as_u16());
+            span.trace_response(response.status().as_u16());
 
             #[cfg(feature = "usdt-probes")]
             probes::request__done!(|| {
