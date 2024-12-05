@@ -14,9 +14,7 @@ use super::versioning::VersionPolicy;
 use super::ProbeRegistration;
 
 #[cfg(feature = "otel-tracing")]
-use opentelemetry::trace::Span;
-#[cfg(feature = "otel-tracing")]
-use crate::{otel, otel::TraceRequest};
+use crate::{otel, otel::{TraceRequest, TraceResponse}};
 
 use async_stream::stream;
 use debug_ignore::DebugIgnore;
@@ -812,8 +810,9 @@ async fn http_request_handle_wrap<C: ServerContext>(
             "latency_us" => latency_us,
         );
 
-        #[cfg(feature = "otel-tracing")]
-        span.trace_response(499);
+        // XXX
+        //#[cfg(feature = "otel-tracing")]
+        //span.trace_response(499);
         #[cfg(feature = "usdt-probes")]
         probes::request__done!(|| {
             crate::dtrace::ResponseInfo {
@@ -846,14 +845,14 @@ async fn http_request_handle_wrap<C: ServerContext>(
     let response = match maybe_response {
         Err(error) => {
             #[cfg(feature = "otel-tracing")]
-            span.record_error(&error);
+            span.trace_error(&error);
 
             let message_external = error.external_message.clone();
             let message_internal = error.internal_message.clone();
             let r = error.into_response(&request_id);
 
             #[cfg(feature = "otel-tracing")]
-            span.trace_response(r.status().as_u16());
+            span.trace_response(&r);
 
             #[cfg(feature = "usdt-probes")]
             probes::request__done!(|| {
@@ -885,7 +884,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
             );
 
             #[cfg(feature = "otel-tracing")]
-            span.trace_response(response.status().as_u16());
+            span.trace_response(&response);
 
             #[cfg(feature = "usdt-probes")]
             probes::request__done!(|| {

@@ -31,7 +31,7 @@ pub fn create_request_span(
 
 pub trait TraceRequest {
     fn trace_request(&mut self, request: &hyper::Request<hyper::body::Incoming>);
-    fn trace_response(&mut self, code: u16);
+    fn trace_error(&mut self, error: &dyn std::error::Error);
 }
 
 impl TraceRequest for opentelemetry::global::BoxedSpan {
@@ -58,7 +58,17 @@ impl TraceRequest for opentelemetry::global::BoxedSpan {
             query: uri.query().map(|x| x.to_string()),
 */
     }
-    fn trace_response(&mut self, code: u16) {
-        self.set_attribute(opentelemetry::KeyValue::new(trace::HTTP_RESPONSE_STATUS_CODE, i64::from(code)));
+    fn trace_error(&mut self, error: &dyn std::error::Error) {
+        self.record_error(&error)
+    }
+}
+
+pub trait TraceResponse<T> {
+    fn trace_response(&mut self, response: &hyper::Response<T>);
+}
+
+impl<T> TraceResponse<T> for opentelemetry::global::BoxedSpan {
+    fn trace_response(&mut self, result: &hyper::Response<T>) {
+        self.set_attribute(opentelemetry::KeyValue::new(trace::HTTP_RESPONSE_STATUS_CODE, i64::from(result.status().as_u16())));
     }
 }
