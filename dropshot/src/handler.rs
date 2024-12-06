@@ -377,6 +377,19 @@ where
     }
 }
 
+impl std::fmt::Display for HandlerError {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Handler { ref message, .. } => message,
+                Self::Dropshot(ref e) => &e.external_message,
+            }
+        )
+    }
+}
+
 /// An error type which can be converted into an HTTP response.
 ///
 /// The error types returned by handlers must implement this trait, so that a
