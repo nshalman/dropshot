@@ -14,10 +14,7 @@ use super::versioning::VersionPolicy;
 use super::ProbeRegistration;
 
 #[cfg(feature = "otel-tracing")]
-use crate::{
-    otel,
-    otel::TraceDropshot,
-};
+use crate::{otel, otel::TraceDropshot};
 
 use async_stream::stream;
 use debug_ignore::DebugIgnore;
@@ -785,7 +782,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
     #[cfg(feature = "otel-tracing")]
     let mut span = otel::create_request_span(&request);
     #[cfg(feature = "otel-tracing")]
-    span.trace_request(crate::dtrace::RequestInfo {
+    span.trace_request(crate::otel::RequestInfo {
         id: request_id.clone(),
         local_addr: server.local_addr,
         remote_addr,
@@ -823,7 +820,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
         );
 
         #[cfg(feature = "otel-tracing")]
-        span.trace_response(crate::dtrace::ResponseInfo {
+        span.trace_response(crate::otel::ResponseInfo {
             id: request_id.clone(),
             local_addr,
             remote_addr,
@@ -871,7 +868,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
                 let message_internal = error.internal_message();
 
                 #[cfg(feature = "otel-tracing")]
-                span.trace_response(crate::dtrace::ResponseInfo {
+                span.trace_response(crate::otel::ResponseInfo {
                     id: request_id.clone(),
                     local_addr,
                     remote_addr,
@@ -913,7 +910,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
             );
 
             #[cfg(feature = "otel-tracing")]
-            span.trace_response(crate::dtrace::ResponseInfo {
+            span.trace_response(crate::otel::ResponseInfo {
                 id: request_id.parse().unwrap(),
                 local_addr,
                 remote_addr,
@@ -940,6 +937,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
 }
 
 #[cfg_attr(feature = "otel-tracing", tracing::instrument(
+    err,
     skip_all,
     fields(
         http.method = request.method().as_str().to_string(),

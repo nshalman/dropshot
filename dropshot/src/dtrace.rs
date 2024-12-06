@@ -1,7 +1,7 @@
 // Copyright 2023 Oxide Computer Company
 //! DTrace probes and support
 
-#[cfg_attr(any, feature = "usdt-probes", feature = "otel-tracing")]
+#[cfg(feature = "usdt-probes")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct RequestInfo {
     pub id: String,
@@ -12,7 +12,7 @@ pub(crate) struct RequestInfo {
     pub query: Option<String>,
 }
 
-#[cfg_attr(any, feature = "usdt-probes", feature = "otel-tracing")]
+#[cfg(feature = "usdt-probes")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct ResponseInfo {
     pub id: String,

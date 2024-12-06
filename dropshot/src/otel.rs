@@ -19,13 +19,40 @@
 //! [1] <https://docs.rs/reqwest-tracing/0.5.4/reqwest_tracing/macro.reqwest_otel_span.html>
 
 #[cfg(feature = "otel-tracing")]
-use crate::dtrace::{RequestInfo, ResponseInfo};
-#[cfg(feature = "otel-tracing")]
 use opentelemetry::{global, trace::Span, trace::Tracer};
 #[cfg(feature = "otel-tracing")]
 use opentelemetry_http::HeaderExtractor;
 #[cfg(feature = "otel-tracing")]
 use opentelemetry_semantic_conventions::trace;
+
+// - http.request.method
+// - url.scheme
+// - server.address
+// - server.port
+// - otel.kind
+// - otel.name
+// - otel.status_code
+// - user_agent.original
+#[cfg(feature = "otel-tracing")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct RequestInfo {
+    pub id: String,
+    pub local_addr: std::net::SocketAddr,
+    pub remote_addr: std::net::SocketAddr,
+    pub method: String,
+    pub path: String,
+    pub query: Option<String>,
+}
+
+#[cfg(feature = "otel-tracing")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ResponseInfo {
+    pub id: String,
+    pub local_addr: std::net::SocketAddr,
+    pub remote_addr: std::net::SocketAddr,
+    pub status_code: u16,
+    pub message: String,
+}
 
 #[cfg(feature = "otel-tracing")]
 fn extract_context_from_request(
@@ -57,26 +84,17 @@ pub trait TraceDropshot {
 #[cfg(feature = "otel-tracing")]
 impl TraceDropshot for opentelemetry::global::BoxedSpan {
     fn trace_request(&mut self, request: RequestInfo) {
-        self.set_attributes(
-            vec![
-            opentelemetry::KeyValue::new(
-                "http.id".to_string(),
-                request.id,
-            ),
+        self.set_attributes(vec![
+            opentelemetry::KeyValue::new("http.id".to_string(), request.id),
             opentelemetry::KeyValue::new(
                 "http.method".to_string(),
                 request.method,
             ),
-            opentelemetry::KeyValue::new(
-                "http.path".to_string(),
-                request.path,
-            ),
-            ],
-        );
+            opentelemetry::KeyValue::new("http.path".to_string(), request.path),
+        ]);
     }
     fn trace_response(&mut self, response: ResponseInfo) {
-        self.set_attributes(
-            vec![
+        self.set_attributes(vec![
             opentelemetry::KeyValue::new(
                 trace::HTTP_RESPONSE_STATUS_CODE,
                 i64::from(response.status_code),
@@ -85,30 +103,6 @@ impl TraceDropshot for opentelemetry::global::BoxedSpan {
                 "http.message".to_string(),
                 response.message,
             ),
-            ],
-        );
+        ]);
     }
 }
-
-/*
-#[cfg_attr(any, feature = "usdt-probes", feature = "otel-tracing")]
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct RequestInfo {
-    pub id: String,
-    pub local_addr: std::net::SocketAddr,
-    pub remote_addr: std::net::SocketAddr,
-    pub method: String,
-    pub path: String,
-    pub query: Option<String>,
-}
-
-#[cfg_attr(any, feature = "usdt-probes", feature = "otel-tracing")]
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ResponseInfo {
-    pub id: String,
-    pub local_addr: std::net::SocketAddr,
-    pub remote_addr: std::net::SocketAddr,
-    pub status_code: u16,
-    pub message: String,
-}
-*/
