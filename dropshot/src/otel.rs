@@ -1,5 +1,22 @@
 // Copyright 2024 Oxide Computer Company
 //! Opentelemetry tracing support
+//!
+//! Fields that we want to produce to provide comparable
+//! functionality to reqwest-tracing[1]:
+//!
+//! - http.request.method
+//! - url.scheme
+//! - server.address
+//! - server.port
+//! - otel.kind
+//! - otel.name
+//! - otel.status_code
+//! - user_agent.original
+//! - http.response.status_code
+//! - error.message
+//! - error.cause_chain
+//!
+//! [1] <https://docs.rs/reqwest-tracing/0.5.4/reqwest_tracing/macro.reqwest_otel_span.html>
 
 #[cfg(feature = "otel-tracing")]
 use crate::dtrace::{RequestInfo, ResponseInfo};
