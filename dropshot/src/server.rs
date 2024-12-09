@@ -945,7 +945,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
         http.version = format!("{:#?}",request.version()),
         http.headers.accept = format!("{:#?}", request.headers()["accept"]),
         http.headers.host = format!("{:#?}", request.headers()["host"]),
-        http.headers.user_agent = format!("{:#?}", request.headers()["user-agent"]),
+        //http.headers.user_agent = format!("{:#?}", request.headers()["user-agent"]),
     ),
 ))]
 async fn http_request_handle<C: ServerContext>(
