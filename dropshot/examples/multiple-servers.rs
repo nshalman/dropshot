@@ -99,7 +99,9 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 #[tokio::main]
+#[tracing::instrument]
 async fn main() -> Result<(), String> {
+    let _otel_guard = equinix_otel_tools::init("dropshot-example");
     // Initial set of servers to start. Once they're running, we may add or
     // remove servers based on client requests.
     let initial_servers = [("A", "127.0.0.1:12345"), ("B", "127.0.0.1:12346")];
@@ -149,6 +151,7 @@ async fn main() -> Result<(), String> {
 type ServerShutdownFuture = BoxFuture<'static, Result<(), String>>;
 
 /// Application-specific server context (state shared by handler functions)
+#[derive(Debug)]
 struct MultiServerContext {
     // All running servers have the same underlying `shared` context.
     shared: Arc<SharedMultiServerContext>,
@@ -169,6 +172,12 @@ impl Drop for MultiServerContext {
 struct SharedMultiServerContext {
     servers: Mutex<HashMap<String, HttpServer<MultiServerContext>>>,
     started_server_shutdown_handles: mpsc::Sender<ServerShutdownFuture>,
+}
+
+impl std::fmt::Debug for SharedMultiServerContext {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        f.debug_struct("SharedMultiServerContext").finish()
+    }
 }
 
 impl SharedMultiServerContext {
@@ -254,6 +263,7 @@ struct ServerDescription {
     method = GET,
     path = "/servers",
 }]
+#[tracing::instrument]
 async fn api_get_servers(
     rqctx: RequestContext<MultiServerContext>,
 ) -> Result<HttpResponseOk<Vec<ServerDescription>>, HttpError> {
@@ -268,10 +278,11 @@ async fn api_get_servers(
         })
         .collect();
 
+    panic!("hahaha");
     Ok(HttpResponseOk(servers))
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 struct PathName {
     name: String,
 }
@@ -281,6 +292,7 @@ struct PathName {
     method = POST,
     path = "/servers/{name}",
 }]
+#[tracing::instrument]
 async fn api_start_server(
     rqctx: RequestContext<MultiServerContext>,
     path: Path<PathName>,
@@ -309,6 +321,7 @@ async fn api_start_server(
     method = DELETE,
     path = "/servers/{name}",
 }]
+#[tracing::instrument]
 async fn api_stop_server(
     rqctx: RequestContext<MultiServerContext>,
     path: Path<PathName>,

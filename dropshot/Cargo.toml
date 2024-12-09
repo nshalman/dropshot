@@ -53,6 +53,7 @@ opentelemetry = { version = "0.27", optional = true }
 opentelemetry-http = { version = "0.27", features = ["hyper"], optional = true }
 opentelemetry-semantic-conventions = { version = "0.27", optional = true }
 tracing = { version = "0.1", optional = true }
+#tracing-futures = { version = "0.2", optional = true }
 
 [dependencies.chrono]
 version = "0.4.38"
@@ -142,7 +143,8 @@ version_check = "0.9.5"
 [features]
 usdt-probes = ["usdt/asm"]
 internal-docs = ["simple-mermaid"]
-otel-tracing = ["opentelemetry", "opentelemetry-http", "opentelemetry-semantic-conventions", "tracing"]
+otel-tracing = ["opentelemetry", "opentelemetry-http", "opentelemetry-semantic-conventions"]
+tokio-tracing = ["tracing"]
 
 [package.metadata.docs.rs]
 features = ["internal-docs"]

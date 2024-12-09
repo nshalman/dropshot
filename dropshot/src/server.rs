@@ -735,7 +735,7 @@ impl<C: ServerContext> FusedFuture for HttpServer<C> {
 /// invoked by Hyper when a new request is received.  This function returns a
 /// Result that either represents a valid HTTP response or an error (which will
 /// also get turned into an HTTP response).
-#[cfg_attr(feature = "otel-tracing", tracing::instrument(
+#[cfg_attr(feature = "tokio-tracing", tracing::instrument(
     err,
     skip_all,
 ))]
@@ -940,7 +940,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
     Ok(response)
 }
 
-#[cfg_attr(feature = "otel-tracing", tracing::instrument(
+#[cfg_attr(feature = "tokio-tracing", tracing::instrument(
     err,
     skip_all,
     fields(
