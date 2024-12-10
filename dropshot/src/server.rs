@@ -981,6 +981,8 @@ async fn http_request_handle<C: ServerContext>(
         endpoint: lookup_result.endpoint,
         request_id: request_id.to_string(),
         log: request_log,
+        #[cfg(feature = "otel-tracing")]
+        otel_context: opentelemetry::Context::current(),
     };
     let handler = lookup_result.handler;
 
