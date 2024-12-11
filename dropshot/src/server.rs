@@ -15,6 +15,8 @@ use super::ProbeRegistration;
 
 #[cfg(feature = "otel-tracing")]
 use crate::{otel, otel::TraceDropshot};
+#[cfg(feature = "otel-tracing")]
+use opentelemetry::trace::TraceContextExt;
 
 use async_stream::stream;
 use debug_ignore::DebugIgnore;
@@ -850,6 +852,10 @@ async fn http_request_handle_wrap<C: ServerContext>(
         });
     });
 
+    #[cfg(feature = "otel-tracing")]
+    let otel_context = opentelemetry::Context::current();
+    assert!(otel_context.has_active_span());
+
     let maybe_response = http_request_handle(
         server,
         request,
@@ -981,8 +987,6 @@ async fn http_request_handle<C: ServerContext>(
         endpoint: lookup_result.endpoint,
         request_id: request_id.to_string(),
         log: request_log,
-        #[cfg(feature = "otel-tracing")]
-        otel_context: opentelemetry::Context::current(),
     };
     let handler = lookup_result.handler;
 

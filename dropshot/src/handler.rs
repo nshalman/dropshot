@@ -86,8 +86,6 @@ pub struct RequestContext<Context: ServerContext> {
     pub log: Logger,
     /// basic request information (method, URI, etc.)
     pub request: RequestInfo,
-    #[cfg(feature = "otel-tracing")]
-    pub otel_context: opentelemetry::Context,
 }
 
 // This is deliberately as close to compatible with `hyper::Request` as

@@ -19,7 +19,7 @@
 //! [1] <https://docs.rs/reqwest-tracing/0.5.4/reqwest_tracing/macro.reqwest_otel_span.html>
 
 #[cfg(feature = "otel-tracing")]
-use opentelemetry::{global, trace::Span, trace::Tracer};
+use opentelemetry::{global, trace::Span, trace::TracerProvider, trace::Tracer};
 #[cfg(feature = "otel-tracing")]
 use opentelemetry_http::HeaderExtractor;
 #[cfg(feature = "otel-tracing")]
@@ -67,10 +67,15 @@ fn extract_context_from_request(
 pub fn create_request_span(
     request: &hyper::Request<hyper::body::Incoming>,
 ) -> opentelemetry::global::BoxedSpan {
+    let tracer_provider = global::tracer_provider();
+    let scope = opentelemetry::InstrumentationScope::builder("dropshot_tracing")
+        .with_version(env!("CARGO_PKG_VERSION"))
+        .with_schema_url("https://opentelemetry.io/schemas/1.17.0")
+        .build();
+    let tracer = tracer_provider.tracer_with_scope(scope);
     let parent_cx = extract_context_from_request(&request);
-    let tracer = global::tracer("");
     tracer
-        .span_builder("dropshot1") //XXX Fixme
+        .span_builder("dropshot_request") //XXX Fixme
         .with_kind(opentelemetry::trace::SpanKind::Server)
         .start_with_context(&tracer, &parent_cx)
 }
