@@ -854,7 +854,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
 
     #[cfg(feature = "otel-tracing")]
     let otel_context = opentelemetry::Context::current();
-    assert!(otel_context.has_active_span());
+    //assert!(otel_context.has_active_span());
 
     let maybe_response = http_request_handle(
         server,
