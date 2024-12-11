@@ -17,6 +17,8 @@ use super::ProbeRegistration;
 use crate::{otel, otel::TraceDropshot};
 #[cfg(feature = "otel-tracing")]
 use opentelemetry::trace::TraceContextExt;
+#[cfg(feature = "otel-tracing")]
+use opentelemetry::trace::Span;
 
 use async_stream::stream;
 use debug_ignore::DebugIgnore;
@@ -816,6 +818,9 @@ async fn http_request_handle_wrap<C: ServerContext>(
     #[cfg_attr(any, feature = "usdt-probes", feature = "otel-tracing")]
     let local_addr = server.local_addr;
 
+    #[cfg(feature = "otel-tracing")]
+    let span_context = span.span_context().clone();
+
     // In the case the client disconnects early, the scopeguard allows us
     // to perform extra housekeeping before this task is dropped.
     let on_disconnect = guard((), |_| {
@@ -852,16 +857,14 @@ async fn http_request_handle_wrap<C: ServerContext>(
         });
     });
 
-    #[cfg(feature = "otel-tracing")]
-    let otel_context = opentelemetry::Context::current();
-    //assert!(otel_context.has_active_span());
-
     let maybe_response = http_request_handle(
         server,
         request,
         &request_id,
         request_log.new(o!()),
         remote_addr,
+        #[cfg(feature = "otel-tracing")]
+        span_context,
     )
     .await;
 
@@ -964,6 +967,8 @@ async fn http_request_handle<C: ServerContext>(
     request_id: &str,
     request_log: Logger,
     remote_addr: std::net::SocketAddr,
+    #[cfg(feature = "otel-tracing")]
+    span_context: opentelemetry::trace::SpanContext,
 ) -> Result<Response<Body>, HandlerError> {
     // TODO-hardening: is it correct to (and do we correctly) read the entire
     // request body even if we decide it's too large and are going to send a 400
@@ -987,6 +992,8 @@ async fn http_request_handle<C: ServerContext>(
         endpoint: lookup_result.endpoint,
         request_id: request_id.to_string(),
         log: request_log,
+        #[cfg(feature = "otel-tracing")]
+        span_context: span_context,
     };
     let handler = lookup_result.handler;
 
