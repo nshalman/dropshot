@@ -46,11 +46,8 @@ use opentelemetry_http::{Bytes, HeaderInjector};
 async fn main() -> Result<(), String> {
     let _otel_guard = equinix_otel_tools::init("otel-demo");
 
-    let config_dropshot: ConfigDropshot = ConfigDropshot {
-        bind_address: std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-            4000,
-        ),
+    let config_dropshot = ConfigDropshot {
+        bind_address: "127.0.0.1:4000".parse().unwrap(),
         ..Default::default()
     };
 
@@ -248,6 +245,7 @@ async fn example_api_error(
     method = GET,
     path = "/panic",
 }]
+#[cfg_attr(feature = "tokio-tracing", tracing::instrument(skip_all, err))]
 async fn example_api_panic(
     _rqctx: RequestContext<ExampleContext>,
 ) -> Result<HttpResponseOk<CounterValue>, HttpError> {
@@ -264,7 +262,7 @@ async fn example_api_panic(
     method = PUT,
     path = "/counter",
 }]
-#[cfg_attr(feature = "tokio-tracing", tracing::instrument)]
+#[cfg_attr(feature = "tokio-tracing", tracing::instrument(skip_all, err))]
 async fn example_api_put_counter(
     rqctx: RequestContext<ExampleContext>,
     update: TypedBody<CounterValue>,
