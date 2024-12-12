@@ -24,13 +24,9 @@ use opentelemetry::{
 use opentelemetry_http::HeaderExtractor;
 use opentelemetry_semantic_conventions::trace;
 
-// - http.request.method
 // - url.scheme
 // - server.address
 // - server.port
-// - otel.kind
-// - otel.name
-// - otel.status_code
 // - user_agent.original
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct RequestInfo {
@@ -40,8 +36,13 @@ pub(crate) struct RequestInfo {
     pub method: String,
     pub path: String,
     pub query: Option<String>,
+    pub user_agent: String,
 }
 
+// - http.response.status_code
+// - error.message
+// - error.cause_chain
+// - otel.status_code
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct ResponseInfo {
     pub id: String,
@@ -59,6 +60,8 @@ fn extract_context_from_request(
     })
 }
 
+// - otel.kind
+// - otel.name
 pub fn create_request_span(
     request: &hyper::Request<hyper::body::Incoming>,
 ) -> opentelemetry::global::BoxedSpan {
@@ -84,14 +87,32 @@ pub trait TraceDropshot {
 impl TraceDropshot for opentelemetry::global::BoxedSpan {
     fn trace_request(&mut self, request: RequestInfo) {
         self.set_attributes(vec![
+            // Rename to dropshot.id ????
             opentelemetry::KeyValue::new("http.id".to_string(), request.id),
             opentelemetry::KeyValue::new(
                 "http.method".to_string(),
                 request.method,
             ),
             opentelemetry::KeyValue::new("http.path".to_string(), request.path),
+            opentelemetry::KeyValue::new(
+                "server.address".to_string(),
+                request.local_addr.ip().to_string(),
+            ),
+            opentelemetry::KeyValue::new(
+                "server.port".to_string(),
+                request.local_addr.port().to_string(),
+            ),
+            opentelemetry::KeyValue::new(
+                "user_agent.original".to_string(),
+                request.user_agent,
+            ),
         ]);
     }
+
+    // - [x] http.response.status_code
+    // - [x] error.message
+    // - [ ] error.cause_chain
+    // - [ ] otel.status_code
     fn trace_response(&mut self, response: ResponseInfo) {
         self.set_attributes(vec![
             opentelemetry::KeyValue::new(
@@ -103,5 +124,6 @@ impl TraceDropshot for opentelemetry::global::BoxedSpan {
                 response.message,
             ),
         ]);
+        //XXX if this is a 5xx error, mark the span as an error
     }
 }

@@ -790,6 +790,12 @@ async fn http_request_handle_wrap<C: ServerContext>(
         method: request.method().to_string(),
         path: request.uri().path().to_string(),
         query: request.uri().query().map(|x| x.to_string()),
+        //XXX this is super-gross. Maybe this should be an Option after all.
+        user_agent: request
+            .headers()
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok().map(str::to_string))
+            .unwrap_or("".to_string()),
     });
 
     trace!(request_log, "incoming request");
