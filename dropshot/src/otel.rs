@@ -43,13 +43,10 @@ pub(crate) struct RequestInfo {
 // - error.message
 // - error.cause_chain
 // - otel.status_code
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct ResponseInfo {
-    pub id: String,
-    pub local_addr: std::net::SocketAddr,
-    pub remote_addr: std::net::SocketAddr,
+pub(crate) struct ResponseInfo<'a> {
     pub status_code: u16,
     pub message: String,
+    pub error: Option<&'a crate::handler::HandlerError>,
 }
 
 fn extract_context_from_request(
@@ -60,8 +57,6 @@ fn extract_context_from_request(
     })
 }
 
-// - otel.kind
-// - otel.name
 pub fn create_request_span(
     request: &hyper::Request<hyper::body::Incoming>,
 ) -> opentelemetry::global::BoxedSpan {
@@ -74,7 +69,7 @@ pub fn create_request_span(
     let tracer = tracer_provider.tracer_with_scope(scope);
     let parent_cx = extract_context_from_request(&request);
     tracer
-        .span_builder("dropshot_request") //XXX Fixme
+        .span_builder("dropshot_request") // TODO? Naming is hard.
         .with_kind(opentelemetry::trace::SpanKind::Server)
         .start_with_context(&tracer, &parent_cx)
 }
@@ -124,6 +119,10 @@ impl TraceDropshot for opentelemetry::global::BoxedSpan {
                 response.message,
             ),
         ]);
-        //XXX if this is a 5xx error, mark the span as an error
+        if let Some(error) = response.error {
+            self.set_status(opentelemetry::trace::Status::error(
+                error.internal_message().clone(),
+            ));
+        }
     }
 }

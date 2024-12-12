@@ -814,7 +814,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
 
     // Copy local address to report later during the finish probe, as the
     // server is passed by value to the request handler function.
-    #[cfg(any(feature = "usdt-probes", feature = "otel-tracing"))]
+    #[cfg(feature = "usdt-probes")]
     let local_addr = server.local_addr;
 
     #[cfg(feature = "otel-tracing")]
@@ -831,14 +831,12 @@ async fn http_request_handle_wrap<C: ServerContext>(
 
         #[cfg(feature = "otel-tracing")]
         span.trace_response(crate::otel::ResponseInfo {
-            id: request_id.clone(),
-            local_addr,
-            remote_addr,
             // 499 is a non-standard code popularized by nginx to mean "client disconnected".
             status_code: 499,
             message: String::from(
                 "client disconnected before response returned",
             ),
+            error: None,
         });
 
         #[cfg(feature = "usdt-probes")]
@@ -881,13 +879,11 @@ async fn http_request_handle_wrap<C: ServerContext>(
 
                 #[cfg(feature = "otel-tracing")]
                 span.trace_response(crate::otel::ResponseInfo {
-                    id: request_id.clone(),
-                    local_addr,
-                    remote_addr,
                     status_code: status.as_u16(),
                     message: message_external
                         .cloned()
                         .unwrap_or_else(|| message_internal.clone()),
+                    error: Some(&error),
                 });
 
                 #[cfg(feature = "usdt-probes")]
@@ -923,11 +919,9 @@ async fn http_request_handle_wrap<C: ServerContext>(
 
             #[cfg(feature = "otel-tracing")]
             span.trace_response(crate::otel::ResponseInfo {
-                id: request_id.parse().unwrap(),
-                local_addr,
-                remote_addr,
                 status_code: response.status().as_u16(),
                 message: "".to_string(),
+                error: None,
             });
 
             #[cfg(feature = "usdt-probes")]

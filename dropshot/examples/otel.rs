@@ -68,6 +68,7 @@ async fn main() -> Result<(), String> {
     api.register(example_api_put_counter).unwrap();
     api.register(example_api_get).unwrap();
     api.register(example_api_error).unwrap();
+    api.register(example_api_panic).unwrap();
 
     // The functions that implement our API endpoints will share this context.
     let api_context = ExampleContext::new();
@@ -201,6 +202,9 @@ async fn example_api_get(
     let req = traced_request("http://localhost:4000/error", &cx).await;
     let _res = client.request(req).await;
 
+    let req = traced_request("http://localhost:4000/panic", &cx).await;
+    let _res = client.request(req).await;
+
     let api_context = rqctx.context();
     Ok(HttpResponseOk(CounterValue {
         counter: api_context.counter.load(Ordering::SeqCst),
@@ -231,6 +235,26 @@ async fn example_api_error(
     _rqctx: RequestContext<ExampleContext>,
 ) -> Result<HttpResponseOk<CounterValue>, HttpError> {
     //XXX Why does this create a 499 rather than a 500 error???
+    // This feels like a bug in dropshot. As a downstream consumer
+    // I just want anything blowing up in my handler to be a somewhat useful 500 error.
+    // It does help that the compiler is strict about what can otherwise be returned...
+    //panic!("This handler is totally broken!");
+
+    Err(HttpError::for_internal_error("This endpoint is broken".to_string()))
+}
+
+/// This endpoint panics!
+#[endpoint {
+    method = GET,
+    path = "/panic",
+}]
+async fn example_api_panic(
+    _rqctx: RequestContext<ExampleContext>,
+) -> Result<HttpResponseOk<CounterValue>, HttpError> {
+    //XXX Why does this create a 499 rather than a 500 error???
+    // This feels like a bug in dropshot. As a downstream consumer
+    // I just want anything blowing up in my handler to be a somewhat useful 500 error.
+    // It does help that the compiler is strict about what can otherwise be returned...
     panic!("This handler is totally broken!");
 }
 
