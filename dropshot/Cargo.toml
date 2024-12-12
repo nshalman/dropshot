@@ -113,6 +113,8 @@ pem = "3.0"
 rcgen = "0.13.1"
 # Used in a doc-test demonstrating the WebsocketUpgrade extractor.
 tokio-tungstenite = "0.24.0"
+# Used in otel-tracing examples
+equinix-otel-tools = { git = "https://github.com/nshalman/rust-otel-tools", rev = "cae47d6a0a891bc095a2d920e2bf2ccbda2be178" }
 
 [dev-dependencies.reqwest]
 version = "0.12.9"
@@ -146,3 +148,7 @@ tokio-tracing = ["tracing"]
 
 [package.metadata.docs.rs]
 features = ["internal-docs"]
+
+[[example]]
+name = "otel"
+required-features = ["otel-tracing"]
