@@ -56,9 +56,8 @@ async fn main() -> Result<(), String> {
 
     // For simplicity, we'll configure an "info"-level logger that writes to
     // stderr assuming that it's a terminal.
-    let config_logging = ConfigLogging::StderrTerminal {
-        level: ConfigLoggingLevel::Info,
-    };
+    let config_logging =
+        ConfigLogging::StderrTerminal { level: ConfigLoggingLevel::Info };
     let log = config_logging
         .to_logger("example-basic")
         .map_err(|error| format!("failed to create logger: {}", error))?;
@@ -68,14 +67,16 @@ async fn main() -> Result<(), String> {
     api.register(example_api_get_counter).unwrap();
     api.register(example_api_put_counter).unwrap();
     api.register(example_api_get).unwrap();
+    api.register(example_api_error).unwrap();
 
     // The functions that implement our API endpoints will share this context.
     let api_context = ExampleContext::new();
 
     // Set up the server.
-    let server = HttpServerStarter::new(&config_dropshot, api, api_context, &log)
-        .map_err(|error| format!("failed to create server: {}", error))?
-        .start();
+    let server =
+        HttpServerStarter::new(&config_dropshot, api, api_context, &log)
+            .map_err(|error| format!("failed to create server: {}", error))?
+            .start();
 
     // Wait for the server to stop.  Note that there's not any code to shut down
     // this server, so we should never get past this point.
@@ -93,9 +94,7 @@ struct ExampleContext {
 impl ExampleContext {
     /// Return a new ExampleContext.
     pub fn new() -> ExampleContext {
-        ExampleContext {
-            counter: AtomicU64::new(0),
-        }
+        ExampleContext { counter: AtomicU64::new(0) }
     }
 }
 
@@ -109,7 +108,26 @@ struct CounterValue {
     counter: u64,
 }
 
-/// Fetch the current value of the counter.
+/// Helper function for propagating a traceparent using hyper
+async fn traced_request(
+    uri: &str,
+    cx: &Context,
+) -> hyper::Request<Full<Bytes>> {
+    let mut req = hyper::Request::builder()
+        .uri(uri)
+        .method(hyper::Method::GET)
+        .header("accept", "application/json")
+        .header("content-type", "application/json");
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(
+            &cx,
+            &mut HeaderInjector(req.headers_mut().unwrap()),
+        )
+    });
+    req.body(Full::new(Bytes::from("".to_string()))).unwrap()
+}
+
+/// Do a bunch of work to show off otel tracing
 #[endpoint {
     method = GET,
     path = "/get",
@@ -119,10 +137,11 @@ async fn example_api_get(
     rqctx: RequestContext<ExampleContext>,
 ) -> Result<HttpResponseOk<CounterValue>, HttpError> {
     let trace_context = opentelemetry::Context::new();
-    let parent_context = opentelemetry::trace::TraceContextExt::with_remote_span_context(
-        &trace_context,
-        rqctx.span_context.clone(),
-    );
+    let parent_context =
+        opentelemetry::trace::TraceContextExt::with_remote_span_context(
+            &trace_context,
+            rqctx.span_context.clone(),
+        );
 
     let client = Client::builder(TokioExecutor::new()).build_http();
     let tracer = global::tracer("");
@@ -139,12 +158,14 @@ async fn example_api_get(
         .header("accept", "application/json")
         .header("content-type", "application/json");
     global::get_text_map_propagator(|propagator| {
-        propagator.inject_context(&cx, &mut HeaderInjector(req.headers_mut().unwrap()))
+        propagator.inject_context(
+            &cx,
+            &mut HeaderInjector(req.headers_mut().unwrap()),
+        )
     });
     let _res = client
         .request(req.body(Full::new(Bytes::from("".to_string()))).unwrap())
-        .await
-        .unwrap();
+        .await;
 
     let mut req = hyper::Request::builder()
         .uri("http://localhost:4000/counter")
@@ -152,12 +173,33 @@ async fn example_api_get(
         .header("accept", "application/json")
         .header("content-type", "application/json");
     global::get_text_map_propagator(|propagator| {
-        propagator.inject_context(&cx, &mut HeaderInjector(req.headers_mut().unwrap()))
+        propagator.inject_context(
+            &cx,
+            &mut HeaderInjector(req.headers_mut().unwrap()),
+        )
     });
     let _res = client
         .request(req.body(Full::new(Bytes::from("".to_string()))).unwrap())
-        .await
-        .unwrap();
+        .await;
+
+    let mut req = hyper::Request::builder()
+        .uri("http://localhost:4000/does-not-exist")
+        .method(hyper::Method::GET)
+        .header("accept", "application/json")
+        .header("content-type", "application/json")
+        .header("user-agent", "dropshot-otel-example");
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(
+            &cx,
+            &mut HeaderInjector(req.headers_mut().unwrap()),
+        )
+    });
+    let _res = client
+        .request(req.body(Full::new(Bytes::from("".to_string()))).unwrap())
+        .await;
+
+    let req = traced_request("http://localhost:4000/error", &cx).await;
+    let _res = client.request(req).await;
 
     let api_context = rqctx.context();
     Ok(HttpResponseOk(CounterValue {
@@ -180,6 +222,18 @@ async fn example_api_get_counter(
     }))
 }
 
+/// Cause an error!
+#[endpoint {
+    method = GET,
+    path = "/error",
+}]
+async fn example_api_error(
+    _rqctx: RequestContext<ExampleContext>,
+) -> Result<HttpResponseOk<CounterValue>, HttpError> {
+    //XXX Why does this create a 499 rather than a 500 error???
+    panic!("This handler is totally broken!");
+}
+
 /// Update the current value of the counter.  Note that the special value of 10
 /// is not allowed (just to demonstrate how to generate an error).
 #[endpoint {
@@ -200,9 +254,7 @@ async fn example_api_put_counter(
             format!("do not like the number {}", updated_value.counter),
         ))
     } else {
-        api_context
-            .counter
-            .store(updated_value.counter, Ordering::SeqCst);
+        api_context.counter.store(updated_value.counter, Ordering::SeqCst);
         Ok(HttpResponseUpdatedNoContent())
     }
 }
