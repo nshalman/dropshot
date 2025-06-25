@@ -43,6 +43,8 @@ slog-async = "2.8.0"
 slog-bunyan = "2.5.0"
 slog-json = "2.6.1"
 slog-term = "2.9.2"
+tracing = { version = "0.1.40", optional = true }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"], optional = true }
 thiserror = "2.0.17"
 tokio-rustls = "0.25.0"
 toml = "0.9.8"
@@ -138,6 +140,7 @@ version_check = "0.9.5"
 [features]
 usdt-probes = ["usdt/asm"]
 internal-docs = ["simple-mermaid"]
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
 
 [package.metadata.docs.rs]
 features = ["internal-docs"]
