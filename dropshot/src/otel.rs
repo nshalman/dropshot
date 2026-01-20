@@ -159,6 +159,14 @@ pub fn create_request_span(
 ) -> tracing::Span {
     let parent_context = extract_context_from_request(request);
     let guard = opentelemetry::Context::attach(parent_context);
+    // Extract forwarded client IP from X-Forwarded-For header if present
+    let forwarded_for = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     let span = tracing::info_span!(
         "http_request",
         http.request.method = %request.method(),
@@ -166,6 +174,7 @@ pub fn create_request_span(
         http.request.id = %request_id,
         client.address = %remote_addr.ip(),
         client.port = remote_addr.port(),
+        client.forwarded_for = %forwarded_for,
         user_agent.original = request.headers().get("user-agent")
             .and_then(|h| h.to_str().ok())
             .unwrap_or(""),
