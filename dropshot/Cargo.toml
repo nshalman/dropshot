@@ -53,12 +53,10 @@ waitgroup = "0.1.2"
 opentelemetry = { version = "0.31", optional = true }
 opentelemetry-http = { version = "0.31", features = ["hyper"], optional = true }
 opentelemetry-semantic-conventions = { version = "0.31", optional = true }
-opentelemetry-otlp = { version = "0.31", features = ["http-proto", "reqwest-rustls"], optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["http-proto", "reqwest-rustls-webpki-roots"], optional = true }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
 opentelemetry-stdout = { version = "0.31", optional = true }
 tracing-opentelemetry = { version = "0.32", optional = true }
-# Force webpki-roots for OTLP HTTP exporter (no native cert dependency)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 
 [dependencies.chrono]
 version = "0.4.42"
@@ -151,7 +149,7 @@ version_check = "0.9.5"
 usdt-probes = ["usdt/asm"]
 internal-docs = ["simple-mermaid"]
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
-otel-tracing = ["tracing", "opentelemetry", "opentelemetry-http", "opentelemetry-semantic-conventions", "opentelemetry-otlp", "opentelemetry_sdk", "opentelemetry-stdout", "tracing-opentelemetry", "reqwest"]
+otel-tracing = ["tracing", "opentelemetry", "opentelemetry-http", "opentelemetry-semantic-conventions", "opentelemetry-otlp", "opentelemetry_sdk", "opentelemetry-stdout", "tracing-opentelemetry"]
 
 [package.metadata.docs.rs]
 features = ["internal-docs"]
