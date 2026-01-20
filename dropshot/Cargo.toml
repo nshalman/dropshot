@@ -50,13 +50,13 @@ tokio-rustls = "0.25.0"
 toml = "0.9.8"
 waitgroup = "0.1.2"
 
-opentelemetry = { version = "0.30", optional = true }
-opentelemetry-http = { version = "0.30", features = ["hyper"], optional = true }
-opentelemetry-semantic-conventions = { version = "0.30", optional = true }
-opentelemetry-otlp = { version = "0.30", features = ["tonic"], optional = true }
-opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"], optional = true }
-opentelemetry-stdout = { version = "0.30", optional = true }
-tracing-opentelemetry = { version = "0.31", optional = true }
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry-http = { version = "0.31", features = ["hyper"], optional = true }
+opentelemetry-semantic-conventions = { version = "0.31", optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["http-proto", "reqwest-rustls"], optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
+opentelemetry-stdout = { version = "0.31", optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
 
 [dependencies.chrono]
 version = "0.4.42"

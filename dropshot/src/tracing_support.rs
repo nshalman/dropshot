@@ -7,7 +7,7 @@
 //! - Unified initialization that supports both
 
 #[cfg(any(feature = "tracing", feature = "otel-tracing"))]
-use tracing_subscriber::prelude::*;
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[cfg(feature = "otel-tracing")]
 use std::sync::OnceLock;
@@ -66,9 +66,17 @@ pub async fn init_tracing(
             // Create layers
             let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-            // Build layered subscriber
-            let subscriber =
-                tracing_subscriber::registry().with(bridge).with(otel_layer);
+            // Create filter from RUST_LOG env var, defaulting to info level
+            // with noisy dependencies suppressed
+            let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new("info,h2=off,hyper=warn,tower=warn,rustls=warn")
+            });
+
+            // Build layered subscriber with filter applied first
+            let subscriber = tracing_subscriber::registry()
+                .with(filter)
+                .with(bridge)
+                .with(otel_layer);
 
             tracing::subscriber::set_global_default(subscriber)?;
 
@@ -82,7 +90,11 @@ pub async fn init_tracing(
     {
         // Only tracing feature - just slog bridge
         let bridge = SlogTracingBridge::new(logger.clone());
-        let subscriber = tracing_subscriber::registry().with(bridge);
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,h2=off,hyper=warn,tower=warn,rustls=warn")
+        });
+        let subscriber =
+            tracing_subscriber::registry().with(filter).with(bridge);
         tracing::subscriber::set_global_default(subscriber)?;
 
         return Ok(Some(TracingGuard {
@@ -96,7 +108,11 @@ pub async fn init_tracing(
         // Only otel-tracing feature
         let (tracer_provider, tracer) = create_otel_tracer().await?;
         let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-        let subscriber = tracing_subscriber::registry().with(otel_layer);
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,h2=off,hyper=warn,tower=warn,rustls=warn")
+        });
+        let subscriber =
+            tracing_subscriber::registry().with(filter).with(otel_layer);
         tracing::subscriber::set_global_default(subscriber)?;
 
         return Ok(Some(TracingGuard {
@@ -133,10 +149,42 @@ async fn create_otel_tracer() -> Result<
     let resource = SdkProvidedResourceDetector.detect();
 
     let tracer_provider =
-        if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+        if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
             // Use OTLP exporter if endpoint is configured
-            use opentelemetry_otlp::SpanExporter;
-            let exporter = SpanExporter::builder().with_http().build()?;
+            use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig};
+
+            // Build the traces endpoint URL
+            let traces_endpoint = if endpoint.ends_with("/v1/traces") {
+                endpoint
+            } else {
+                format!("{}/v1/traces", endpoint.trim_end_matches('/'))
+            };
+
+            // Parse headers from OTEL_EXPORTER_OTLP_HEADERS
+            let headers: std::collections::HashMap<String, String> =
+                if let Ok(headers_str) = std::env::var("OTEL_EXPORTER_OTLP_HEADERS") {
+                    headers_str
+                        .split(',')
+                        .filter_map(|pair| {
+                            let mut parts = pair.splitn(2, '=');
+                            match (parts.next(), parts.next()) {
+                                (Some(k), Some(v)) => {
+                                    Some((k.trim().to_string(), v.trim().to_string()))
+                                }
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+            let exporter = SpanExporter::builder()
+                .with_http()
+                .with_endpoint(&traces_endpoint)
+                .with_headers(headers)
+                .build()?;
+
             SdkTracerProvider::builder()
                 .with_resource(resource)
                 .with_batch_exporter(exporter)

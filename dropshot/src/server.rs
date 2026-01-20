@@ -798,9 +798,16 @@ async fn http_request_handle_wrap<C: ServerContext>(
     #[cfg(feature = "usdt-probes")]
     let local_addr = server.local_addr;
 
+    // Skip OTEL tracing for the traces endpoint to avoid infinite loops
     #[cfg(feature = "otel-tracing")]
-    let request_span =
-        otel::create_request_span(&request, &request_id, remote_addr);
+    let skip_tracing = request.uri().path() == "/v1/traces";
+
+    #[cfg(feature = "otel-tracing")]
+    let request_span = if skip_tracing {
+        None
+    } else {
+        Some(otel::create_request_span(&request, &request_id, remote_addr))
+    };
 
     let disconnect_log = request_log.clone();
     #[cfg(feature = "otel-tracing")]
@@ -819,7 +826,9 @@ async fn http_request_handle_wrap<C: ServerContext>(
         );
 
         #[cfg(feature = "otel-tracing")]
-        otel::record_disconnect_on_span(&disconnect_span_clone);
+        if let Some(ref span) = disconnect_span_clone {
+            otel::record_disconnect_on_span(span);
+        }
 
         #[cfg(feature = "usdt-probes")]
         probes::request__done!(|| {
@@ -837,7 +846,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
     });
 
     #[cfg(feature = "otel-tracing")]
-    let _span_guard = request_span.enter();
+    let _span_guard = request_span.as_ref().map(|s| s.enter());
 
     let maybe_response = http_request_handle(
         server,
@@ -861,11 +870,13 @@ async fn http_request_handle_wrap<C: ServerContext>(
                 let message_internal = error.internal_message();
 
                 #[cfg(feature = "otel-tracing")]
-                otel::record_error_on_span(
-                    &request_span,
-                    status.as_u16(),
-                    message_internal,
-                );
+                if let Some(ref span) = request_span {
+                    otel::record_error_on_span(
+                        span,
+                        status.as_u16(),
+                        message_internal,
+                    );
+                }
 
                 #[cfg(feature = "usdt-probes")]
                 probes::request__done!(|| {
@@ -899,10 +910,12 @@ async fn http_request_handle_wrap<C: ServerContext>(
             );
 
             #[cfg(feature = "otel-tracing")]
-            otel::record_success_on_span(
-                &request_span,
-                response.status().as_u16(),
-            );
+            if let Some(ref span) = request_span {
+                otel::record_success_on_span(
+                    span,
+                    response.status().as_u16(),
+                );
+            }
 
             #[cfg(feature = "usdt-probes")]
             probes::request__done!(|| {
