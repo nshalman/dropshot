@@ -958,6 +958,11 @@ async fn http_request_handle<C: ServerContext>(
         uri.path().into(),
         found_version.as_ref(),
     )?;
+    #[cfg(feature = "otel-tracing")]
+    otel::record_operation_id_on_span(
+        &lookup_result.endpoint.operation_id,
+    );
+
     let rqctx = RequestContext {
         server: Arc::clone(&server),
         request: RequestInfo::new(&request, remote_addr),

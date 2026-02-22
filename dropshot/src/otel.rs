@@ -179,6 +179,7 @@ pub fn create_request_span(
             .and_then(|h| h.to_str().ok())
             .unwrap_or(""),
         otel.kind = "server",
+        dropshot.operation_id = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
         error = tracing::field::Empty,
         error.type = tracing::field::Empty,
@@ -206,6 +207,15 @@ pub fn record_error_on_span(span: &tracing::Span, status: u16, message: &str) {
     span.record("error", true);
     span.record("error.message", message);
     flush_spans();
+}
+
+/// Record the operation ID for the endpoint handler on a span.
+/// Called after the router resolves the request to a specific endpoint.
+/// Uses `Span::current()` because the request span is entered in the
+/// caller but not passed into `http_request_handle` by reference.
+pub fn record_operation_id_on_span(operation_id: &str) {
+    tracing::Span::current()
+        .record("dropshot.operation_id", operation_id);
 }
 
 /// Record successful response information on a span
