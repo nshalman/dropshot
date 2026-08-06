@@ -4,8 +4,8 @@
 # used for registering API handler functions.
 #
 [workspace]
-members = ["dropshot", "dropshot_endpoint" ]
-default-members = ["dropshot", "dropshot_endpoint" ]
+members = ["dropshot", "dropshot-otel", "dropshot_endpoint" ]
+default-members = ["dropshot", "dropshot-otel", "dropshot_endpoint" ]
 
 resolver = "2"
 
