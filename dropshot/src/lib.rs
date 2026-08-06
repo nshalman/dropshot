@@ -877,6 +877,7 @@ mod extractor;
 mod from_map;
 mod handler;
 mod http_util;
+mod instrument;
 mod logging;
 mod pagination;
 mod router;
