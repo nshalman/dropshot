@@ -1,0 +1,47 @@
+[package]
+name = "dropshot-otel"
+description = "opinionated OpenTelemetry tracing setup for Dropshot servers"
+version = "0.1.0"
+authors = ["Nahum Shalman <nahamu@gmail.com>"]
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository = "https://github.com/oxidecomputer/dropshot/"
+keywords = ["opentelemetry", "tracing", "dropshot"]
+categories = ["development-tools::debugging", "network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "internal-logs"] }
+slog = { version = "2.8.2", features = ["dynamic-keys"] }
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.33", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "registry", "std"] }
+
+[features]
+# The OTLP exporter speaks HTTP; the `tls` feature lets it also speak HTTPS,
+# using rustls with the aws-lc-rs crypto provider (matching dropshot's own
+# TLS stack) and the platform's certificate verifier.  Build with
+# default-features = false for a plain-HTTP-only exporter.
+default = ["tls"]
+tls = ["opentelemetry-otlp/reqwest-rustls"]
+
+[dev-dependencies]
+dropshot = { version = "^0.17.1", path = "../dropshot", features = ["tracing"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "testing"] }
+reqwest = { version = "0.13.4", default-features = false }
+schemars = "0.8.22"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+slog = "2.8.2"
+slog-json = "2.6.1"
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.33", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
