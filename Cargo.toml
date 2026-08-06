@@ -1,11 +1,13 @@
 #
-# Dropshot is comprised of two packages.  Consumers only need to know about
-# "dropshot".  "dropshot" depends on "dropshot_endpoint", a procedural macro
-# used for registering API handler functions.
+# Dropshot is comprised of two packages, plus an optional companion crate.
+# Consumers only need to know about "dropshot".  "dropshot" depends on
+# "dropshot_endpoint", a procedural macro used for registering API handler
+# functions.  "dropshot-otel" exports the spans produced by dropshot's
+# "tracing" feature via OpenTelemetry.
 #
 [workspace]
-members = ["dropshot", "dropshot_endpoint" ]
-default-members = ["dropshot", "dropshot_endpoint" ]
+members = ["dropshot", "dropshot-otel", "dropshot_endpoint" ]
+default-members = ["dropshot", "dropshot-otel", "dropshot_endpoint" ]
 
 resolver = "2"
 
