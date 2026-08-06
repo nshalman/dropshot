@@ -9,8 +9,6 @@ use super::compression::apply_gzip_compression;
 use super::compression::is_compressible_content_type;
 use super::compression::should_compress_response;
 use super::config::{CompressionConfig, ConfigDropshot, ConfigTls};
-#[cfg(feature = "usdt-probes")]
-use super::dtrace::probes;
 use super::handler::HandlerError;
 use super::handler::RequestContext;
 use super::http_util::HEADER_REQUEST_ID;
@@ -782,23 +780,16 @@ async fn http_request_handle_wrap<C: ServerContext>(
     }
 
     trace!(request_log, "incoming request");
-    #[cfg(feature = "usdt-probes")]
-    probes::request__start!(|| {
-        let uri = request.uri();
-        crate::dtrace::RequestInfo {
-            id: request_id.clone(),
-            local_addr: server.local_addr,
-            remote_addr,
-            method: request.method().to_string(),
-            path: uri.path().to_string(),
-            query: uri.query().map(|x| x.to_string()),
-        }
-    });
 
-    // Copy local address to report later during the finish probe, as the
-    // server is passed by value to the request handler function.
-    #[cfg(feature = "usdt-probes")]
-    let local_addr = server.local_addr;
+    // The instrumentation handle captures what it needs (e.g. the local
+    // address) up front, as the server is passed by value to the request
+    // handler function.
+    let instrumentation = crate::instrument::RequestInstrumentation::start(
+        &server,
+        &request,
+        &request_id,
+        remote_addr,
+    );
 
     // In the case the client disconnects early, the scopeguard allows us
     // to perform extra housekeeping before this task is dropped.
@@ -809,26 +800,14 @@ async fn http_request_handle_wrap<C: ServerContext>(
             error!(request_log, "request handling panicked";
                 "latency_us" => latency_us,
             );
+            instrumentation.panicked();
             return;
         }
 
         warn!(request_log, "request handling cancelled (client disconnected)";
             "latency_us" => latency_us,
         );
-
-        #[cfg(feature = "usdt-probes")]
-        probes::request__done!(|| {
-            crate::dtrace::ResponseInfo {
-                id: request_id.clone(),
-                local_addr,
-                remote_addr,
-                // 499 is a non-standard code popularized by nginx to mean "client disconnected".
-                status_code: 499,
-                message: String::from(
-                    "client disconnected before response returned",
-                ),
-            }
-        });
+        instrumentation.disconnected();
     });
 
     let maybe_response = http_request_handle(
@@ -852,18 +831,11 @@ async fn http_request_handle_wrap<C: ServerContext>(
                 let message_external = error.external_message();
                 let message_internal = error.internal_message();
 
-                #[cfg(feature = "usdt-probes")]
-                probes::request__done!(|| {
-                    crate::dtrace::ResponseInfo {
-                        id: request_id.clone(),
-                        local_addr,
-                        remote_addr,
-                        status_code: status.as_u16(),
-                        message: message_external
-                            .cloned()
-                            .unwrap_or_else(|| message_internal.clone()),
-                    }
-                });
+                instrumentation.errored(
+                    status.as_u16(),
+                    message_external.map(String::as_str),
+                    message_internal,
+                );
 
                 // TODO-debug: add request and response headers here
                 info!(request_log, "request completed";
@@ -883,16 +855,7 @@ async fn http_request_handle_wrap<C: ServerContext>(
                 "latency_us" => latency_us,
             );
 
-            #[cfg(feature = "usdt-probes")]
-            probes::request__done!(|| {
-                crate::dtrace::ResponseInfo {
-                    id: request_id.parse().unwrap(),
-                    local_addr,
-                    remote_addr,
-                    status_code: response.status().as_u16(),
-                    message: "".to_string(),
-                }
-            });
+            instrumentation.responded(response.status().as_u16());
 
             response
         }
