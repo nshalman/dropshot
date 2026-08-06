@@ -22,6 +22,8 @@ mod openapi;
 mod pagination;
 mod pagination_schema;
 mod path_names;
+#[cfg(feature = "usdt-probes")]
+mod probes;
 mod starter;
 mod streaming;
 mod tls;
