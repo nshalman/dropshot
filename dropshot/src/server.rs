@@ -821,14 +821,14 @@ async fn http_request_handle_wrap<C: ServerContext>(
         instrumentation.disconnected();
     });
 
-    let maybe_response = http_request_handle(
+    let handle_fut = http_request_handle(
         server,
         request,
         &request_id,
         request_log.new(o!()),
         remote_addr,
-    )
-    .await;
+    );
+    let maybe_response = instrumentation.in_span(handle_fut).await;
 
     // If `http_request_handle` completed, it means the request wasn't
     // cancelled and we can safely "defuse" the scopeguard.
@@ -898,6 +898,10 @@ async fn http_request_handle<C: ServerContext>(
         uri.path().into(),
         found_version.as_ref(),
     )?;
+    crate::instrument::record_operation_id(
+        &method,
+        &lookup_result.endpoint.operation_id,
+    );
     let rqctx = RequestContext {
         server: Arc::clone(&server),
         request: RequestInfo::new(&request, remote_addr),
@@ -921,7 +925,7 @@ async fn http_request_handle<C: ServerContext>(
             let (tx, rx) = oneshot::channel();
             let request_log = request_log.clone();
             let worker = server.handler_waitgroup_worker.clone();
-            let handler_task = tokio::spawn(async move {
+            let handler_fut = async move {
                 let request_log = rqctx.log.clone();
                 let result = handler.handle_request(rqctx, request).await;
 
@@ -946,7 +950,10 @@ async fn http_request_handle<C: ServerContext>(
                 // Drop our waitgroup worker, allowing graceful shutdown to
                 // complete (if it's waiting on us).
                 mem::drop(worker);
-            });
+            };
+            // Keep the detached handler task attached to the request span.
+            let handler_task =
+                tokio::spawn(crate::instrument::in_current_span(handler_fut));
 
             // The only way we can fail to receive on `rx` is if `tx` is
             // dropped before a result is sent, which can only happen if
