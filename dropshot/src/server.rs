@@ -805,6 +805,13 @@ async fn http_request_handle_wrap<C: ServerContext>(
     let on_disconnect = guard((), |_| {
         let latency_us = start_time.elapsed().as_micros();
 
+        if std::thread::panicking() {
+            error!(request_log, "request handling panicked";
+                "latency_us" => latency_us,
+            );
+            return;
+        }
+
         warn!(request_log, "request handling cancelled (client disconnected)";
             "latency_us" => latency_us,
         );
