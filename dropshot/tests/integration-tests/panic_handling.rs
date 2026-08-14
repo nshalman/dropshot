@@ -73,6 +73,30 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 struct TestState {
     slow_started: AtomicBool,
     slow_completed: AtomicBool,
+    handler_dropped: AtomicBool,
+    disconnect_reported: AtomicBool,
+}
+
+/// A synchronous drain that flags the disconnect report the moment it is
+/// logged.  The file-based log used elsewhere in this module is written by
+/// an asynchronous drain and so cannot observe the *ordering* of in-flight
+/// events; this can, because it runs inside the `warn!` call itself.
+struct DisconnectFlagDrain(Arc<TestState>);
+
+impl slog::Drain for DisconnectFlagDrain {
+    type Ok = ();
+    type Err = slog::Never;
+
+    fn log(
+        &self,
+        record: &slog::Record,
+        _values: &slog::OwnedKVList,
+    ) -> Result<(), slog::Never> {
+        if record.msg().to_string() == DISCONNECT {
+            self.0.disconnect_reported.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
 }
 
 fn api() -> ApiDescription<Arc<TestState>> {
@@ -81,6 +105,8 @@ fn api() -> ApiDescription<Arc<TestState>> {
     api.register(handler_panic_extractor).unwrap();
     api.register(handler_ok).unwrap();
     api.register(handler_slow).unwrap();
+    api.register(handler_slow_drop).unwrap();
+    api.register(handler_busy_drop).unwrap();
     api
 }
 
@@ -146,6 +172,53 @@ async fn handler_slow(
     tokio::time::sleep(SLOW_HANDLER_DURATION).await;
     state.slow_completed.store(true, Ordering::SeqCst);
     Ok(HttpResponseOk(2))
+}
+
+/// A handler local whose destructor takes a while and then records that it
+/// ran, so that a test can observe when a cancelled handler's destructors
+/// run relative to the disconnect being reported.
+struct SlowDropGuard {
+    state: Arc<TestState>,
+}
+
+impl Drop for SlowDropGuard {
+    fn drop(&mut self) {
+        std::thread::sleep(Duration::from_secs(2));
+        self.state.handler_dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+#[endpoint {
+    method = GET,
+    path = "/slow-drop",
+}]
+async fn handler_slow_drop(
+    rqctx: RequestContext<Arc<TestState>>,
+) -> Result<HttpResponseOk<u64>, HttpError> {
+    let state = Arc::clone(rqctx.context());
+    let _guard = SlowDropGuard { state: Arc::clone(&state) };
+    state.slow_started.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    Ok(HttpResponseOk(4))
+}
+
+/// Like `/slow-drop`, but spends its time *inside* `poll` (blocking) rather
+/// than parked at an await point, so that a disconnect arrives while the
+/// handler is mid-poll.
+#[endpoint {
+    method = GET,
+    path = "/busy-drop",
+}]
+async fn handler_busy_drop(
+    rqctx: RequestContext<Arc<TestState>>,
+) -> Result<HttpResponseOk<u64>, HttpError> {
+    let state = Arc::clone(rqctx.context());
+    let _guard = SlowDropGuard { state: Arc::clone(&state) };
+    state.slow_started.store(true, Ordering::SeqCst);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Creates a file-based logger so that tests can verify what was reported.
@@ -548,6 +621,78 @@ async fn test_disconnect_reported_as_disconnect_cancel_on_disconnect() {
         HandlerTaskMode::CancelOnDisconnect,
     )
     .await;
+}
+
+/// Observes the ordering of a cancelled handler's destructors relative to
+/// the disconnect report in `CancelOnDisconnect` mode, for a handler
+/// parked at an await point (the common case): the destructors complete
+/// before the disconnect is reported.
+///
+/// Inline execution guarantees this by Rust drop order (the handler future
+/// is dropped, synchronously, before the disconnect scopeguard fires).
+/// Notably, an abort-based implementation preserves it too, because
+/// tokio's `abort()` drops a parked task's future inline on the aborting
+/// thread.  So this test pins the ordering as a contract without
+/// prescribing the mechanism.
+async fn cancel_cleanup_ordering(path: &str) -> bool {
+    use slog::Drain;
+
+    let state = Arc::new(TestState::default());
+    let log = Logger::root(
+        DisconnectFlagDrain(Arc::clone(&state)).fuse(),
+        slog::o!(),
+    );
+    let server = ServerBuilder::new(api(), state.clone(), log)
+        .config(ConfigDropshot {
+            default_handler_task_mode: HandlerTaskMode::CancelOnDisconnect,
+            ..Default::default()
+        })
+        .start()
+        .unwrap();
+
+    let stream = raw_get(server.local_addr(), path).await;
+    wait_for_flag(&state.slow_started, "handler never started").await;
+    drop(stream);
+
+    wait_for_flag(&state.disconnect_reported, "disconnect never reported")
+        .await;
+    let dropped_when_reported = state.handler_dropped.load(Ordering::SeqCst);
+
+    // The handler's destructors eventually run regardless; observing that
+    // before returning keeps this test from exiting mid-drop.
+    wait_for_flag(&state.handler_dropped, "handler destructors never ran")
+        .await;
+    server.close().await.unwrap();
+    dropped_when_reported
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cancel_on_disconnect_parked_handler_cleanup_precedes_report() {
+    assert!(
+        cancel_cleanup_ordering("/slow-drop").await,
+        "expected a parked handler's destructors to complete before the \
+         disconnect is reported"
+    );
+}
+
+/// The mid-poll variant: the handler blocks inside `poll`, so the
+/// disconnect arrives while it is being polled.  Inline execution still
+/// guarantees cleanup-before-report (the future can only be dropped
+/// between polls, by the same task that then reports the disconnect); an
+/// abort-based implementation cannot drop a mid-poll future inline, so the
+/// disconnect is reported first and the destructors run afterward,
+/// concurrently.  This is the one observable behavioral difference between
+/// the two mechanisms, which is why this test is ignored by default: it
+/// characterizes the current mechanism rather than pinning a contract.
+#[ignore = "characterizes inline-drop vs abort-based cancellation"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cancel_on_disconnect_busy_handler_cleanup_precedes_report() {
+    assert!(
+        cancel_cleanup_ordering("/busy-drop").await,
+        "expected a mid-poll handler's destructors to complete before the \
+         disconnect is reported (abort-based cancellation reports first \
+         and cleans up concurrently)"
+    );
 }
 
 /// Case 6: tearing the server down while a request is in flight is a
