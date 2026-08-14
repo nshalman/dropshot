@@ -37,6 +37,7 @@ use std::num::NonZeroU32;
 use std::panic;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
 use tokio::net::{TcpListener, TcpStream};
@@ -848,60 +849,138 @@ async fn http_request_handle_wrap<C: ServerContext>(
         });
     });
 
-    // Backstop: catch a panic escaping from anywhere in request handling
-    // other than the handler itself -- e.g. a user-provided version policy,
-    // or dropshot's own routing code.  (Handler panics never unwind through
-    // here; they come back as `HandlerError::Panicked` and are handled
-    // below.)  Without this, the unwind would drop the scopeguard and
-    // misreport the panic as a client disconnection.  Unwind safety is not
-    // a concern because the panic is resumed immediately after being
-    // reported.
-    let caught = panic::AssertUnwindSafe(http_request_handle(
-        server,
-        request,
-        &request_id,
-        request_log.new(o!()),
-        remote_addr,
-    ))
-    .catch_unwind()
-    .await;
-    let maybe_response = match caught {
-        Ok(maybe_response) => maybe_response,
-        Err(payload) => {
-            // Defuse the guard before resuming the unwind below; otherwise
-            // the unwind would drop it and misreport this panic as a client
-            // disconnection.
-            let _ = ScopeGuard::into_inner(on_disconnect);
-            let latency_us = start_time.elapsed().as_micros();
-            // `&*` is load-bearing: `&payload` would coerce the `Box`
-            // itself into the `dyn Any` and every downcast would miss.
-            let message = panic_message(&*payload);
-            error!(request_log, "request handling panicked (outside the handler)";
-                "latency_us" => latency_us,
-                "panic_message" => message,
-            );
+    // Spawn the rest of request handling as its own task, in both handler
+    // task modes.  This task boundary is the only panic catcher: tokio
+    // catches a panic anywhere in request handling -- the handler, its
+    // extractors, a user-provided version policy, dropshot's own routing --
+    // at this boundary and hands it back as a value (a `JoinError`), so no
+    // `catch_unwind` is needed anywhere.  In particular, a panic can never
+    // unwind through `on_disconnect` above and be misreported as a client
+    // disconnection.
+    //
+    // The `in_handler` flag attributes such a panic to the handler or to
+    // the rest of request handling: the task sets it around the handler
+    // call, and it is read only after the task has completed.
+    let task_mode = server.config.default_handler_task_mode;
+    let in_handler = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = oneshot::channel();
+    let pipeline_task = {
+        let in_handler = Arc::clone(&in_handler);
+        let request_id = request_id.clone();
+        let request_log = request_log.new(o!());
+        // Only Detached-mode requests must block graceful shutdown.
+        let worker = match task_mode {
+            HandlerTaskMode::Detached => {
+                Some(server.handler_waitgroup_worker.clone())
+            }
+            HandlerTaskMode::CancelOnDisconnect => None,
+        };
+        tokio::spawn(async move {
+            let result = http_request_handle(
+                server,
+                request,
+                &request_id,
+                request_log.clone(),
+                remote_addr,
+                &in_handler,
+            )
+            .await;
 
-            // Fire request-done so that every request-start is paired with
-            // a request-done even when the request ends in a panic.
-            #[cfg(feature = "usdt-probes")]
-            probes::request__done!(|| {
-                crate::dtrace::ResponseInfo {
-                    id: request_id.clone(),
-                    local_addr,
-                    remote_addr,
-                    // 0 is not a valid HTTP status code; it conventionally
-                    // means "no response was received".
-                    status_code: 0,
-                    message: format!(
-                        "request handling panicked (outside the handler): \
-                         {message}"
+            // If this send fails, our spawning task has been cancelled in
+            // the `rx.await` below; log such a result.
+            if let Err(result) = tx.send(result) {
+                match result {
+                    Ok(r) => warn!(
+                        request_log, "request completed after handler was already cancelled";
+                        "response_code" => r.status().as_u16(),
                     ),
+                    Err(error) => {
+                        warn!(request_log, "request completed after handler was already cancelled";
+                            "response_code" => error.status_code().as_u16(),
+                            "error_message_internal" => error.internal_message(),
+                            "error_message_external" => error.external_message(),
+                        );
+                    }
                 }
-            });
+            }
 
-            panic::resume_unwind(payload);
+            // Drop our waitgroup worker (if any), allowing graceful
+            // shutdown to complete (if it's waiting on us).
+            mem::drop(worker);
+        })
+    };
+
+    // In CancelOnDisconnect mode, propagate our own cancellation to the
+    // pipeline task: if this future is dropped, abort it.  (In Detached
+    // mode the task is left to run to completion.)
+    let abort_on_disconnect = match task_mode {
+        HandlerTaskMode::CancelOnDisconnect => {
+            Some(guard(pipeline_task.abort_handle(), |h| h.abort()))
+        }
+        HandlerTaskMode::Detached => None,
+    };
+
+    let maybe_response = match rx.await {
+        Ok(result) => result,
+        Err(_) => {
+            // The only way we can fail to receive on `rx` is if `tx` was
+            // dropped before a result was sent, which is only possible if
+            // the pipeline task panicked (we hold the only abort handle,
+            // and we are still running).  Tokio caught the panic at the
+            // task boundary; collect it as a value.
+            let task_err = pipeline_task
+                .await
+                .expect_err("task failed to send result but didn't panic");
+            let payload = task_err.into_panic();
+            if in_handler.load(Ordering::SeqCst) {
+                if matches!(task_mode, HandlerTaskMode::Detached) {
+                    debug!(request_log, "handler panicked; relaying panic");
+                }
+                Err(handler_panicked(payload))
+            } else {
+                // A panic outside the handler.  Defuse the guard before
+                // resuming the unwind below; otherwise the unwind would
+                // drop it and misreport this panic as a client
+                // disconnection.
+                let _ = ScopeGuard::into_inner(on_disconnect);
+                let latency_us = start_time.elapsed().as_micros();
+                // `&*` is load-bearing: `&payload` would coerce the `Box`
+                // itself into the `dyn Any` and every downcast would miss.
+                let message = panic_message(&*payload);
+                error!(request_log, "request handling panicked (outside the handler)";
+                    "latency_us" => latency_us,
+                    "panic_message" => message,
+                );
+
+                // Fire request-done so that every request-start is paired
+                // with a request-done even when the request ends in a
+                // panic.
+                #[cfg(feature = "usdt-probes")]
+                probes::request__done!(|| {
+                    crate::dtrace::ResponseInfo {
+                        id: request_id.clone(),
+                        local_addr,
+                        remote_addr,
+                        // 0 is not a valid HTTP status code; it
+                        // conventionally means "no response was received".
+                        status_code: 0,
+                        message: format!(
+                            "request handling panicked (outside the \
+                             handler): {message}"
+                        ),
+                    }
+                });
+
+                panic::resume_unwind(payload);
+            }
         }
     };
+
+    // The pipeline completed (or its panic was collected as a value), so
+    // there is no cancellation to propagate: defuse the abort guard.
+    if let Some(g) = abort_on_disconnect {
+        let _ = ScopeGuard::into_inner(g);
+    }
 
     // If `http_request_handle` completed, it means the request wasn't
     // cancelled and we can safely "defuse" the scopeguard.
@@ -1001,6 +1080,7 @@ async fn http_request_handle<C: ServerContext>(
     request_id: &str,
     request_log: Logger,
     remote_addr: std::net::SocketAddr,
+    in_handler: &AtomicBool,
 ) -> Result<Response<Body>, HandlerError> {
     // TODO-hardening: is it correct to (and do we correctly) read the entire
     // request body even if we decide it's too large and are going to send a 400
@@ -1028,83 +1108,16 @@ async fn http_request_handle<C: ServerContext>(
     let request_headers = rqctx.request.headers().clone();
     let handler = lookup_result.handler;
 
-    let mut response = match server.config.default_handler_task_mode {
-        HandlerTaskMode::CancelOnDisconnect => {
-            // For CancelOnDisconnect, we run the request handler directly: if
-            // the client disconnects, we will be cancelled, and therefore this
-            // future will too.
-            //
-            // Catch a panic in the handler so that it can be reported as a
-            // handler panic (see `HandlerError::Panicked`) rather than
-            // unwinding through our caller.  Unwind safety is not a concern
-            // because the panic is resumed once it has been reported.
-            match panic::AssertUnwindSafe(
-                handler.handle_request(rqctx, request),
-            )
-            .catch_unwind()
-            .await
-            {
-                Ok(result) => result?,
-                Err(payload) => return Err(handler_panicked(payload)),
-            }
-        }
-        HandlerTaskMode::Detached => {
-            // Spawn the handler so if we're cancelled, the handler still runs
-            // to completion.
-            let (tx, rx) = oneshot::channel();
-            let request_log = request_log.clone();
-            let worker = server.handler_waitgroup_worker.clone();
-            let handler_task = tokio::spawn(async move {
-                let request_log = rqctx.log.clone();
-                let result = handler.handle_request(rqctx, request).await;
-
-                // If this send fails, our spawning task has been cancelled in
-                // the `rx.await` below; log such a result.
-                if let Err(result) = tx.send(result) {
-                    match result {
-                        Ok(r) => warn!(
-                            request_log, "request completed after handler was already cancelled";
-                            "response_code" => r.status().as_u16(),
-                        ),
-                        Err(error) => {
-                            warn!(request_log, "request completed after handler was already cancelled";
-                                "response_code" => error.status_code().as_u16(),
-                                "error_message_internal" => error.internal_message(),
-                                "error_message_external" => error.external_message(),
-                            );
-                        }
-                    }
-                }
-
-                // Drop our waitgroup worker, allowing graceful shutdown to
-                // complete (if it's waiting on us).
-                mem::drop(worker);
-            });
-
-            // The only way we can fail to receive on `rx` is if `tx` is
-            // dropped before a result is sent, which can only happen if
-            // `handle_request` panics. We will propagate such a panic here,
-            // just as we would have in `CancelOnDisconnect` mode above (where
-            // we call the handler directly).
-            match rx.await {
-                Ok(result) => result?,
-                Err(_) => {
-                    debug!(request_log, "handler panicked; relaying panic");
-
-                    // To get the panic, we now need to await `handler_task`; we
-                    // know it is complete _and_ it failed, because it has
-                    // dropped `tx` without sending us a result, which is only
-                    // possible if it panicked.  Note that tokio already caught
-                    // the panic at the task boundary, so the payload comes
-                    // back to us as a value -- no `catch_unwind` needed.
-                    let task_err = handler_task.await.expect_err(
-                        "task failed to send result but didn't panic",
-                    );
-                    return Err(handler_panicked(task_err.into_panic()));
-                }
-            }
-        }
-    };
+    // Bracket the handler call (which includes running its extractors) so
+    // that a panic escaping this task can be attributed to the handler or
+    // to the rest of request handling.  The flag is only read by our
+    // spawner after this task has completed, so the ordering is not
+    // subtle; a returned error is a value, not a panic, so the flag is
+    // cleared before `?`.
+    in_handler.store(true, Ordering::SeqCst);
+    let result = handler.handle_request(rqctx, request).await;
+    in_handler.store(false, Ordering::SeqCst);
+    let mut response = result?;
 
     if matches!(server.config.compression, CompressionConfig::Gzip)
         && is_compressible_content_type(response.headers())
