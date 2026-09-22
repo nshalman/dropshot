@@ -48,6 +48,7 @@ slog-term = "2.9.2"
 thiserror = "2.0.18"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
 toml = "1.1.2"
+tracing = { version = "0.1.44", optional = true }
 waitgroup = "0.1.2"
 
 [dependencies.chrono]
@@ -144,6 +145,7 @@ version_check = "0.9.5"
 [features]
 usdt-probes = ["usdt/asm"]
 internal-docs = ["simple-mermaid"]
+tracing = ["dep:tracing"]
 
 [package.metadata.docs.rs]
 features = ["internal-docs"]
