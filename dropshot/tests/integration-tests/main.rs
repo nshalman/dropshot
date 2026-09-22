@@ -24,6 +24,8 @@ mod pagination_schema;
 mod path_names;
 #[cfg(feature = "usdt-probes")]
 mod probes;
+#[cfg(feature = "tracing")]
+mod request_spans;
 mod starter;
 mod streaming;
 mod tls;

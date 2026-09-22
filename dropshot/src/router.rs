@@ -72,6 +72,10 @@ pub struct HttpRouter<Context: ServerContext> {
     /// indicates whether this router contains any endpoints that are
     /// constrained by version
     has_versioned_routes: bool,
+    /// every HTTP method (uppercased) that some endpoint handles, for the
+    /// request's tracing span
+    #[cfg(feature = "tracing")]
+    methods: BTreeSet<String>,
 }
 
 /// Each node in the tree represents a group of HTTP resources having the same
@@ -215,6 +219,9 @@ impl MapValue for VariableValue {
 pub struct RouterLookupResult<Context: ServerContext> {
     pub handler: Arc<dyn RouteHandler<Context>>,
     pub endpoint: RequestEndpointMetadata,
+    /// The matched endpoint's path template, for the request's tracing span.
+    #[cfg(feature = "tracing")]
+    pub(crate) route: String,
 }
 
 impl<Context: ServerContext> HttpRouterNode<Context> {
@@ -229,6 +236,8 @@ impl<Context: ServerContext> HttpRouter<Context> {
         HttpRouter {
             root: Box::new(HttpRouterNode::new()),
             has_versioned_routes: false,
+            #[cfg(feature = "tracing")]
+            methods: BTreeSet::new(),
         }
     }
 
@@ -412,6 +421,14 @@ impl<Context: ServerContext> HttpRouter<Context> {
         }
 
         existing_handlers.push(endpoint);
+        #[cfg(feature = "tracing")]
+        self.methods.insert(methodname);
+    }
+
+    /// Returns whether some endpoint handles the given (uppercased) method.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn handles_method(&self, method: &str) -> bool {
+        self.methods.contains(method)
     }
 
     /// Returns whether this router contains any routes that are constrained by
@@ -516,6 +533,8 @@ impl<Context: ServerContext> HttpRouter<Context> {
                     body_content_type: handler.body_content_type.clone(),
                     request_body_max_bytes: handler.request_body_max_bytes,
                 },
+                #[cfg(feature = "tracing")]
+                route: handler.path.clone(),
             });
         }
 

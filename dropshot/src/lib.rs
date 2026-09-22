@@ -854,6 +854,84 @@
 //! {"ok":{"id":"a53696af-543d-452f-81b6-5a045dd9921d","local_addr":"127.0.0.1:61028","remote_addr":"127.0.0.1:57376","method":"PUT","path":"/counter","query":null}}
 //! {"ok":{"id":"a53696af-543d-452f-81b6-5a045dd9921d","local_addr":"127.0.0.1:61028","remote_addr":"127.0.0.1:57376","status_code":204,"message":""}}
 //! ```
+//!
+//! ## Tracing
+//!
+//! With the optional `"tracing"` feature, Dropshot creates one INFO-level
+//! [`tracing`](https://docs.rs/tracing) span named `dropshot_request` for
+//! each request, with target `dropshot::instrument`.  Handler code runs
+//! inside that span, so spans and events the handler creates are its
+//! children.  Dropshot installs no subscriber and takes no dependency on
+//! OpenTelemetry: with no subscriber the spans cost almost nothing, and what
+//! consumes them (for example, an OpenTelemetry exporter built on
+//! `tracing-opentelemetry`) is up to the application.
+//!
+//! The span's fields follow the [OpenTelemetry semantic conventions for HTTP
+//! server spans](https://opentelemetry.io/docs/specs/semconv/http/http-spans/),
+//! plus a few Dropshot-specific fields under `dropshot.`.  Numeric fields are
+//! recorded as `i64`.
+//!
+//! Recorded when the request arrives:
+//!
+//! * `http.request.method`.  A method is known if the conventions define it
+//!   (those of RFC 9110, `PATCH`, and `QUERY`) or some endpoint handles it.
+//!   As Dropshot routes methods case-insensitively, a method whose uppercase
+//!   form is known is reported in that form; any other method is reported
+//!   as `_OTHER`.  Either way, `http.request.method_original` has the method
+//!   as sent if it differs.
+//! * `url.path`, and `url.query` if the request has one.  **The query string
+//!   is recorded as sent**, so it may contain secrets (tokens, signatures);
+//!   applications should scrub it before export if that is a concern.
+//! * `url.scheme`: `http` or `https`.
+//! * `network.protocol.version`: e.g. `1.1`, `2`.
+//! * `server.address`, `server.port`: the server's name and port as the
+//!   client addressed it (from the request URI's authority, else the `Host`
+//!   header), with the scheme's default port if none is given.  Omitted if
+//!   neither is present.  Forwarding headers such as `X-Forwarded-Host` are
+//!   not consulted.
+//! * `client.address`, `network.peer.address`, `network.peer.port`: the
+//!   address of the connection's peer.  Forwarding headers such as
+//!   `X-Forwarded-For` are not consulted.
+//! * `user_agent.original`, `http.request.header.traceparent`,
+//!   `http.request.header.tracestate`: those request headers, if present.
+//!   The trace context headers let a subscriber parent the span into a
+//!   distributed trace (Dropshot itself does not interpret them).  Unlike the
+//!   conventions' string arrays, header values are recorded as strings.
+//! * `dropshot.request_id`: the request's id, as used in Dropshot's logs.
+//! * `otel.kind`: always `server`; `otel.name`: the span name, initially
+//!   the method (or `HTTP` for `_OTHER`).  These are
+//!   [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry)'s
+//!   special fields for span kind and name.
+//!
+//! Recorded once the request is routed to an endpoint:
+//!
+//! * `http.route`: the endpoint's path template, e.g. `/projects/{project}`.
+//! * `dropshot.operation_id`: the endpoint's operation id.
+//! * `otel.name` is updated to `{method} {http.route}`.
+//!
+//! Recorded when the request completes:
+//!
+//! * `http.response.status_code`, when a response is produced.
+//! * For 5xx responses: `error.type` (the status code, e.g. `500`) and
+//!   `otel.status_code = ERROR`.  4xx responses are not errors for a server
+//!   span.
+//! * For error responses: `dropshot.error.message`, the internal
+//!   (operator-facing) message, and `dropshot.error.message_external`, the
+//!   client-facing message when known.  (Dropshot's own `HttpError`s have
+//!   one; user-defined error types serialize their client-facing content
+//!   directly into the response body.)  For 5xx responses, the internal
+//!   message is also the span status description, `otel.status_description`.
+//! * If the client disconnects before a response is produced: no status code
+//!   (none was sent), `error.type = client_disconnect`,
+//!   `otel.status_code = ERROR`, and a status description.  A handler panic
+//!   that propagates out of request handling is indistinguishable
+//!   from a disconnect here and is reported the same way.
+//!
+//! The span covers request handling up to the point where the response is
+//! handed back to hyper; streaming the response body is not included.  In
+//! the default `HandlerTaskMode::Detached`, a handler that keeps running
+//! after its client disconnects keeps the span open until it finishes, but
+//! its eventual outcome is not recorded: the span reports the disconnect.
 
 // The `usdt` crate may require nightly, enabled if our consumer is enabling
 // DTrace probes.
