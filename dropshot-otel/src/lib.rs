@@ -8,7 +8,8 @@
 //! Dropshot itself has no opinion about what consumes those spans.  This
 //! crate is one such consumer: it wires up the `tracing` machinery to export
 //! the spans via OTLP, propagate W3C trace context from incoming requests,
-//! and (optionally) forward `tracing` events into an existing `slog` logger.
+//! and (optionally) forward `tracing` events into an existing `slog` logger
+//! and report per-request [`metrics`].
 //!
 //! # Usage
 //!
@@ -48,11 +49,12 @@
 //!   [`builder`] is used.
 //!
 //! `RUST_LOG` (via [`tracing_subscriber::EnvFilter`]) controls which spans
-//! and events are recorded at all, defaulting to `info` with noisy HTTP
-//! internals suppressed.  It filters span export as well as the slog bridge:
-//! dropshot's request spans are INFO-level spans with target
-//! `dropshot::instrument`, so a filter that excludes them (e.g. `warn`, or
-//! `myapp=debug`) also stops them being exported.
+//! are exported and which events reach the slog bridge, defaulting to `info`
+//! with noisy HTTP internals suppressed.  Dropshot's request spans are
+//! INFO-level spans with target `dropshot::instrument`, so a filter that
+//! excludes them (e.g. `warn`, or `myapp=debug`) also stops them being
+//! exported.  It does not affect request metrics
+//! ([`Builder::with_request_metrics`]).
 //!
 //! The exporter speaks OTLP over HTTP.  With the default `tls` cargo feature
 //! it can also speak HTTPS, using rustls with the aws-lc-rs provider (the
@@ -61,6 +63,7 @@
 //!
 //! [Dropshot]: https://docs.rs/dropshot
 
+pub mod metrics;
 mod propagation;
 mod slog_bridge;
 
@@ -76,6 +79,7 @@ use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt;
 
 /// Default `EnvFilter` directive when `RUST_LOG` is not set: our own spans
@@ -92,6 +96,7 @@ pub fn builder(service_name: impl Into<String>) -> Builder {
         service_name: service_name.into(),
         slog_logger: None,
         scrubber: None,
+        request_metrics: None,
     }
 }
 
@@ -102,6 +107,7 @@ pub struct Builder {
     service_name: String,
     slog_logger: Option<slog::Logger>,
     scrubber: Option<Scrubber>,
+    request_metrics: Option<RequestRecorder>,
 }
 
 /// Errors from [`Builder::install`].
@@ -180,20 +186,40 @@ impl Builder {
         self
     }
 
+    /// Reports every request dropshot handles to `recorder`, as it completes;
+    /// see [`metrics`].  Unlike span export and the slog bridge, this does
+    /// not depend on `RUST_LOG`.
+    pub fn with_request_metrics(
+        mut self,
+        recorder: impl Fn(&metrics::CompletedRequest) + Send + Sync + 'static,
+    ) -> Self {
+        self.request_metrics = Some(RequestRecorder(Box::new(recorder)));
+        self
+    }
+
     /// Installs the global `tracing` subscriber and, if an OTLP endpoint is
     /// configured in the environment, the OpenTelemetry export pipeline.
     ///
-    /// If there is nothing to do — no OTLP endpoint configured and no slog
-    /// bridge requested — this installs nothing and returns an inert
-    /// [`Guard`], leaving the global subscriber slot free for other use.
+    /// If there is nothing to do — no OTLP endpoint configured, and neither
+    /// the slog bridge nor request metrics requested — this installs nothing
+    /// and returns an inert [`Guard`], leaving the global subscriber slot
+    /// free for other use.
     pub fn install(self) -> Result<Guard, InitError> {
         let export = export_enabled()?;
-        if !export && self.slog_logger.is_none() {
+        if !export
+            && self.slog_logger.is_none()
+            && self.request_metrics.is_none()
+        {
             return Ok(Guard { provider: None });
         }
 
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+        // `RUST_LOG` filters each layer that honors it, rather than the whole
+        // subscriber, so that it cannot stop request metrics.  (`EnvFilter`
+        // isn't `Clone`, hence the closure.)
+        let filter = || {
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
+        };
 
         let (otel_layer, provider) = if export {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -209,15 +235,21 @@ impl Builder {
             let layer = TraceContextLayer::new(
                 tracing_opentelemetry::layer()
                     .with_tracer(provider.tracer("dropshot-otel")),
-            );
+            )
+            .with_filter(filter());
             (Some(layer), Some(provider))
         } else {
             (None, None)
         };
 
-        let bridge = self.slog_logger.map(SlogBridge::new);
+        let bridge = self
+            .slog_logger
+            .map(|logger| SlogBridge::new(logger).with_filter(filter()));
+        let request_metrics = self
+            .request_metrics
+            .map(|RequestRecorder(recorder)| metrics::layer(recorder));
         let subscriber =
-            tracing_subscriber::registry().with(filter).with(bridge);
+            tracing_subscriber::registry().with(bridge).with(request_metrics);
         // Not `.with(otel_layer)`: `Option<Layer>` doesn't pass
         // `on_register_dispatch` through, which TraceContextLayer uses.
         match otel_layer {
@@ -270,6 +302,16 @@ impl Drop for Guard {
                 );
             }
         }
+    }
+}
+
+/// A function given each completed request; see
+/// [`Builder::with_request_metrics`].
+struct RequestRecorder(Box<dyn Fn(&metrics::CompletedRequest) + Send + Sync>);
+
+impl std::fmt::Debug for RequestRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RequestRecorder")
     }
 }
 
@@ -379,6 +421,7 @@ mod test {
     //! Run any other way, the `child_*` tests do nothing.
 
     use opentelemetry::trace::{Span as _, Tracer as _};
+    use std::sync::{Arc, Mutex};
 
     const CHILD_ENV: &str = "DROPSHOT_OTEL_TEST_CHILD";
     const EXPECT_ENV: &str = "DROPSHOT_OTEL_TEST_EXPECT";
@@ -545,6 +588,214 @@ mod test {
         }
         assert!(!global_tracer_installed());
         assert!(global_subscriber_free());
+    }
+
+    /// Requests received by an OTLP sink: each one's path and body.
+    type Received = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// Receives OTLP/HTTP requests, recording each one's path and body.
+    /// Returns the endpoint to point an exporter at, and the requests
+    /// received so far.
+    fn start_otlp_sink() -> (String, Received) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let received: Received = Default::default();
+        let sink = Arc::clone(&received);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let sink = Arc::clone(&sink);
+                std::thread::spawn(move || {
+                    let mut stream = BufReader::new(stream.unwrap());
+                    // One request per iteration, until the client hangs up.
+                    loop {
+                        let mut request_line = String::new();
+                        if stream.read_line(&mut request_line).unwrap_or(0) == 0
+                        {
+                            return;
+                        }
+                        let path = request_line
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_string();
+                        let mut content_length = 0;
+                        loop {
+                            let mut header = String::new();
+                            stream.read_line(&mut header).unwrap();
+                            let header = header.trim_end();
+                            if header.is_empty() {
+                                break;
+                            }
+                            if let Some((name, value)) = header.split_once(':')
+                            {
+                                if name.eq_ignore_ascii_case("content-length") {
+                                    content_length =
+                                        value.trim().parse().unwrap();
+                                }
+                            }
+                        }
+                        let mut body = vec![0; content_length];
+                        stream.read_exact(&mut body).unwrap();
+                        sink.lock().unwrap().push((path, body));
+                        stream
+                            .get_mut()
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                            )
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        (endpoint, received)
+    }
+
+    /// Returns whether any request `path` in `received` has a body containing
+    /// `needle`.
+    fn sent(
+        received: &Mutex<Vec<(String, Vec<u8>)>>,
+        path: &str,
+        needle: &str,
+    ) -> bool {
+        received.lock().unwrap().iter().any(|(p, body)| {
+            p == path
+                && body.windows(needle.len()).any(|w| w == needle.as_bytes())
+        })
+    }
+
+    #[dropshot::endpoint {
+        method = GET,
+        path = "/ping",
+    }]
+    async fn ping(
+        _rqctx: dropshot::RequestContext<()>,
+    ) -> Result<dropshot::HttpResponseOk<()>, dropshot::HttpError> {
+        tracing::info!("info from handler");
+        tracing::warn!("warn from handler");
+        Ok(dropshot::HttpResponseOk(()))
+    }
+
+    /// Starts a dropshot server, makes one request of it, and shuts it down.
+    fn serve_one_request() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut api = dropshot::ApiDescription::new();
+            api.register(ping).unwrap();
+            let log = slog::Logger::root(slog::Discard, slog::o!());
+            let server =
+                dropshot::ServerBuilder::new(api, (), log).start().unwrap();
+            let url = format!("http://{}/ping", server.local_addr());
+            let response = reqwest::get(url).await.unwrap();
+            assert_eq!(response.status(), 200);
+            // Shut down so that the request span has closed.
+            server.close().await.unwrap();
+        });
+    }
+
+    /// A slog drain that keeps the messages it is given.
+    struct Messages(Arc<Mutex<Vec<String>>>);
+
+    impl slog::Drain for Messages {
+        type Ok = ();
+        type Err = slog::Never;
+
+        fn log(
+            &self,
+            record: &slog::Record<'_>,
+            _values: &slog::OwnedKVList,
+        ) -> Result<(), slog::Never> {
+            self.0.lock().unwrap().push(record.msg().to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_install_exports_request_spans() {
+        let (endpoint, received) = start_otlp_sink();
+        run_child(
+            "child_serves_one_request",
+            &[("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint)],
+        );
+        // Exported, and named for the endpoint (by TraceContextLayer).
+        assert!(sent(&received, "/v1/traces", "GET /ping"));
+    }
+
+    #[test]
+    fn test_install_span_export_honors_rust_log() {
+        let (endpoint, received) = start_otlp_sink();
+        run_child(
+            "child_serves_one_request",
+            &[("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint), ("RUST_LOG", "warn")],
+        );
+        assert!(!sent(&received, "/v1/traces", "/ping"));
+    }
+
+    #[test]
+    fn child_serves_one_request() {
+        if !is_child() {
+            return;
+        }
+        let _guard = super::builder("test").install().unwrap();
+        serve_one_request();
+    }
+
+    #[test]
+    fn test_install_request_metrics() {
+        // Request metrics don't depend on RUST_LOG, which does still filter
+        // the slog bridge.
+        run_child("child_request_metrics", &[("RUST_LOG", "warn")]);
+    }
+
+    #[test]
+    fn child_request_metrics() {
+        if !is_child() {
+            return;
+        }
+        let messages: Arc<Mutex<Vec<String>>> = Default::default();
+        let completed: Arc<Mutex<Vec<u16>>> = Default::default();
+        let sink = Arc::clone(&completed);
+        let _guard = super::builder("test")
+            .with_slog_bridge(slog::Logger::root(
+                Messages(Arc::clone(&messages)),
+                slog::o!(),
+            ))
+            .with_request_metrics(move |request| {
+                sink.lock().unwrap().push(request.status_code.unwrap());
+            })
+            .install()
+            .unwrap();
+        serve_one_request();
+        assert_eq!(*completed.lock().unwrap(), [200]);
+        let messages = messages.lock().unwrap();
+        let from_handler: Vec<_> =
+            messages.iter().filter(|m| m.ends_with("from handler")).collect();
+        assert_eq!(from_handler, ["warn from handler"]);
+    }
+
+    #[test]
+    fn test_install_request_metrics_alone() {
+        // Request metrics alone are reason enough to install a subscriber.
+        run_child("child_request_metrics_alone", &[]);
+    }
+
+    #[test]
+    fn child_request_metrics_alone() {
+        if !is_child() {
+            return;
+        }
+        let completed: Arc<Mutex<Vec<u16>>> = Default::default();
+        let sink = Arc::clone(&completed);
+        let _guard = super::builder("test")
+            .with_request_metrics(move |request| {
+                sink.lock().unwrap().push(request.status_code.unwrap());
+            })
+            .install()
+            .unwrap();
+        assert!(!global_subscriber_free());
+        serve_one_request();
+        assert_eq!(*completed.lock().unwrap(), [200]);
     }
 
     #[test]
