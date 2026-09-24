@@ -33,6 +33,9 @@ tls = ["opentelemetry-otlp/reqwest-rustls"]
 
 [dev-dependencies]
 dropshot = { version = "^0.17.1", path = "../dropshot", features = ["tracing"] }
+http = "1.4.1"
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "trace", "testing"] }
 reqwest = { version = "0.13.4", default-features = false }
 schemars = "0.8.22"
@@ -44,4 +47,8 @@ tokio = { version = "1.49.0", features = ["full"] }
 # Run the example's unit tests with the crate's other tests.
 [[example]]
 name = "request_metrics"
+test = true
+
+[[example]]
+name = "prometheus"
 test = true
