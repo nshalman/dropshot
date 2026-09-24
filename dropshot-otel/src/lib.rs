@@ -205,7 +205,7 @@ impl Builder {
     /// and returns an inert [`Guard`], leaving the global subscriber slot
     /// free for other use.
     pub fn install(self) -> Result<Guard, InitError> {
-        let export = export_enabled()?;
+        let export = export_enabled("TRACES")?;
         if !export
             && self.slog_logger.is_none()
             && self.request_metrics.is_none()
@@ -379,26 +379,30 @@ fn resource(service_name: String) -> Resource {
     resource.build()
 }
 
-/// Returns whether the environment asks for spans to be exported: an OTLP
-/// endpoint is configured, and neither the SDK nor trace export is disabled.
-/// Fails if it asks for an OTLP protocol this crate cannot speak (which the
-/// exporter would otherwise silently replace with "http/protobuf").
-fn export_enabled() -> Result<bool, InitError> {
+/// Returns whether the environment asks for the given signal (`TRACES` or
+/// `METRICS`, as named in environment variables) to be exported: an OTLP
+/// endpoint is configured, and neither the SDK nor the signal's export is
+/// disabled.  Fails if it asks for an OTLP protocol this crate cannot speak
+/// (which the exporter would otherwise silently replace with
+/// "http/protobuf").
+fn export_enabled(signal: &str) -> Result<bool, InitError> {
     let endpoint = !env_unset("OTEL_EXPORTER_OTLP_ENDPOINT")
-        || !env_unset("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+        || !env_unset(&format!("OTEL_EXPORTER_OTLP_{signal}_ENDPOINT"));
     let sdk_disabled = std::env::var("OTEL_SDK_DISABLED")
         .is_ok_and(|v| v.trim().eq_ignore_ascii_case("true"));
-    let exporter_none = std::env::var("OTEL_TRACES_EXPORTER")
+    let exporter_none = std::env::var(format!("OTEL_{signal}_EXPORTER"))
         .is_ok_and(|v| v.trim().eq_ignore_ascii_case("none"));
     if !endpoint || sdk_disabled || exporter_none {
         return Ok(false);
     }
 
-    let protocol =
-        ["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "OTEL_EXPORTER_OTLP_PROTOCOL"]
-            .into_iter()
-            .find(|name| !env_unset(name))
-            .map(|name| std::env::var(name).unwrap());
+    let protocol = [
+        format!("OTEL_EXPORTER_OTLP_{signal}_PROTOCOL"),
+        "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
+    ]
+    .into_iter()
+    .find(|name| !env_unset(name))
+    .map(|name| std::env::var(name).unwrap());
     match protocol {
         Some(protocol) if protocol != "http/protobuf" => {
             Err(InitError::UnsupportedProtocol(protocol))
