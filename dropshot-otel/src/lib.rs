@@ -84,6 +84,26 @@
 //! same TLS stack dropshot uses) and the platform certificate store; build
 //! with `default-features = false` for plain-HTTP-only exporters.
 //!
+//! # Prometheus
+//!
+//! This crate exports metrics only via OTLP; it doesn't serve a Prometheus
+//! scrape endpoint.  To get them into Prometheus, either:
+//!
+//! * Send them through an OpenTelemetry Collector, which can serve them for
+//!   Prometheus to scrape or write them to Prometheus remotely.  This is the
+//!   usual deployment, and the Collector can take traces too.
+//! * Send them to Prometheus directly, if it runs with its OTLP receiver
+//!   enabled (`--web.enable-otlp-receiver`): set
+//!   `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to
+//!   `http://<prometheus>:9090/api/v1/otlp/v1/metrics`.
+//!
+//! Either way, by default Prometheus sees the request duration metric as
+//! `http_server_request_duration_seconds`.  An application that would
+//! rather be scraped directly, or already uses the [`metrics`
+//! crate](https://docs.rs/metrics), can record requests itself with
+//! [`Builder::with_request_metrics`]; examples/prometheus.rs does this,
+//! serving the same metric, with the same labels, at `/metrics`.
+//!
 //! [Dropshot]: https://docs.rs/dropshot
 
 pub mod metrics;
