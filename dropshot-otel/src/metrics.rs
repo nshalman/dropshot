@@ -215,7 +215,8 @@ impl DurationHistogram {
                 .f64_histogram("http.server.request.duration")
                 .with_unit("s")
                 .with_description("Duration of HTTP server requests.")
-                // The semantic conventions' advised bucket boundaries.
+                // The semantic conventions' advised bucket boundaries, used
+                // unless the histogram is exported with exponential buckets.
                 .with_boundaries(vec![
                     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0,
                     2.5, 5.0, 7.5, 10.0,

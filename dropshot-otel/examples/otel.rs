@@ -1,5 +1,5 @@
 // Copyright 2026 Oxide Computer Company
-//! Example use of Dropshot with OpenTelemetry tracing.
+//! Example use of Dropshot with OpenTelemetry tracing and metrics.
 //!
 //! Run an OTLP-over-HTTP collector (e.g. an otel-enabled Jaeger
 //! all-in-one) and point the exporter at it:
@@ -13,10 +13,30 @@
 //! ```
 //!
 //! Each request appears as a trace; the second joins the trace given in its
-//! `traceparent` header.  Request durations are also exported, as the
-//! `http.server.request.duration` metric, once a minute and on exit (set
-//! `OTEL_METRICS_EXPORTER=none` if the collector doesn't accept metrics).  Query parameters named in `SENSITIVE_PARAMS` are
-//! redacted before export: after
+//! `traceparent` header.
+//!
+//! Metrics are exported once a minute and on exit (set
+//! `OTEL_METRICS_EXPORTER=none` if the collector doesn't accept metrics).
+//! Two histograms show the two ways OpenTelemetry can bucket values:
+//!
+//! * Request durations (the standard `http.server.request.duration` metric)
+//!   use the default: fixed buckets, here the boundaries the semantic
+//!   conventions advise for request durations, so the metric compares
+//!   directly with other HTTP servers'.
+//! * The values the counter is set to (`example.counter.value`, recorded by
+//!   the application itself) use exponential buckets: clients can set any
+//!   value from 0 to 2^64 - 1, so there are no sensible fixed boundaries,
+//!   and exponential buckets keep their relative resolution at any scale.
+//!
+//! ```bash
+//! for n in 3 1000 250000 70000000000; do
+//!     curl -X PUT -H 'content-type: application/json' \
+//!         -d "{\"counter\": $n}" http://localhost:4000/counter
+//! done
+//! ```
+//!
+//! Query parameters named in `SENSITIVE_PARAMS` are redacted before export:
+//! after
 //!
 //! ```bash
 //! curl 'http://localhost:4000/counter?token=s3cret&verbose=1'
@@ -26,7 +46,7 @@
 //!
 //! Without `OTEL_EXPORTER_OTLP_ENDPOINT` set, the server runs normally and
 //! exports nothing.  Stop the server with Ctrl-C (SIGINT) so that buffered
-//! spans are flushed on the way out.
+//! spans and metrics are flushed on the way out.
 
 use dropshot::ApiDescription;
 use dropshot::ConfigLogging;
@@ -38,6 +58,8 @@ use dropshot::RequestContext;
 use dropshot::ServerBuilder;
 use dropshot::TypedBody;
 use dropshot::endpoint;
+use dropshot_otel::HistogramAggregation;
+use opentelemetry::metrics::Histogram;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -58,15 +80,29 @@ async fn main() -> Result<(), String> {
     let _guard = dropshot_otel::builder("dropshot-otel-example")
         .with_slog_bridge(log.clone())
         .with_span_scrubber(scrub_span)
+        .with_histogram_aggregation(
+            COUNTER_VALUE_METRIC,
+            HistogramAggregation::Exponential,
+        )
         .install()
         .map_err(|error| format!("failed to initialize tracing: {}", error))?;
+
+    // Instruments come from the global meter provider, which `install()`
+    // set up (if metrics export is configured; otherwise they do nothing).
+    let context = ExampleContext {
+        counter: AtomicU64::new(0),
+        counter_values: opentelemetry::global::meter("dropshot-otel-example")
+            .u64_histogram(COUNTER_VALUE_METRIC)
+            .with_description("Values the counter was set to.")
+            .build(),
+    };
 
     let mut api = ApiDescription::new();
     api.register(example_api_get_counter).unwrap();
     api.register(example_api_put_counter).unwrap();
     api.register(example_api_error).unwrap();
 
-    let server = ServerBuilder::new(api, ExampleContext::default(), log)
+    let server = ServerBuilder::new(api, context, log)
         .config(dropshot::ConfigDropshot {
             bind_address: "127.0.0.1:4000".parse().unwrap(),
             ..Default::default()
@@ -111,10 +147,13 @@ fn scrub_span(span: &mut opentelemetry_sdk::trace::SpanData) {
     }
 }
 
+/// The name of the histogram of values the counter is set to.
+const COUNTER_VALUE_METRIC: &str = "example.counter.value";
+
 /// Application-specific example context (state shared by handler functions)
-#[derive(Default)]
 struct ExampleContext {
     counter: AtomicU64,
+    counter_values: Histogram<u64>,
 }
 
 /// `CounterValue` represents the value of the API's counter, either as the
@@ -162,6 +201,7 @@ async fn example_api_put_counter(
         ))
     } else {
         api_context.counter.store(updated_value.counter, Ordering::SeqCst);
+        api_context.counter_values.record(updated_value.counter, &[]);
         Ok(HttpResponseUpdatedNoContent())
     }
 }

@@ -59,6 +59,14 @@
 //!   except for the opt-in `server.address` and `server.port`, plus any
 //!   [`metrics::label`]s.  Installing also sets the global OpenTelemetry
 //!   meter provider, for the application's own metrics.
+//! * Histograms, that one and any the application records, are exported
+//!   with explicit (fixed) buckets by default, the request duration's being
+//!   the semantic conventions' advised ones.  The standard
+//!   `OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION` variable
+//!   can select `base2_exponential_bucket_histogram` instead; an
+//!   unrecognized value is ignored with a warning.  The application can
+//!   choose the aggregation for particular histograms with
+//!   [`Builder::with_histogram_aggregation`], which takes precedence.
 //! * If neither `OTEL_SERVICE_NAME` nor a `service.name` in
 //!   `OTEL_RESOURCE_ATTRIBUTES` is set, the service name passed to
 //!   [`builder`] is used.
@@ -89,10 +97,13 @@ use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::{
+    Aggregation, Instrument, InstrumentKind, SdkMeterProvider, Stream,
+};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::resource::{EnvResourceDetector, ResourceDetector};
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -114,6 +125,7 @@ pub fn builder(service_name: impl Into<String>) -> Builder {
         slog_logger: None,
         scrubber: None,
         request_metrics: None,
+        histogram_aggregations: HashMap::new(),
     }
 }
 
@@ -125,6 +137,7 @@ pub struct Builder {
     slog_logger: Option<slog::Logger>,
     scrubber: Option<Scrubber>,
     request_metrics: Option<RequestRecorder>,
+    histogram_aggregations: HashMap<String, HistogramAggregation>,
 }
 
 /// Errors from [`Builder::install`].
@@ -217,6 +230,24 @@ impl Builder {
         self
     }
 
+    /// Exports the histogram named `instrument` (e.g. one the application
+    /// records with the global meter provider) with the given aggregation,
+    /// whatever the default (see the crate docs).  Instrument names match
+    /// case-insensitively.
+    ///
+    /// For example, a histogram whose values span orders of magnitude with
+    /// no natural bucket boundaries, such as payload sizes, suits
+    /// [`HistogramAggregation::Exponential`].
+    pub fn with_histogram_aggregation(
+        mut self,
+        instrument: impl Into<String>,
+        aggregation: HistogramAggregation,
+    ) -> Self {
+        self.histogram_aggregations
+            .insert(instrument.into().to_lowercase(), aggregation);
+        self
+    }
+
     /// Installs the global `tracing` subscriber and, if an OTLP endpoint is
     /// configured in the environment, the OpenTelemetry export pipelines.
     ///
@@ -272,10 +303,17 @@ impl Builder {
             let exporter = opentelemetry_otlp::MetricExporter::builder()
                 .with_http()
                 .build()?;
+            let view = HistogramView {
+                default: default_histogram_aggregation(),
+                overrides: self.histogram_aggregations,
+            };
             Some(
                 SdkMeterProvider::builder()
                     .with_resource(resource)
                     .with_periodic_exporter(exporter)
+                    .with_view(move |instrument: &Instrument| {
+                        view.stream(instrument)
+                    })
                     .build(),
             )
         } else {
@@ -476,6 +514,87 @@ fn export_enabled(signal: &str) -> Result<bool, InitError> {
     }
 }
 
+/// How an exported histogram aggregates its measurements.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistogramAggregation {
+    /// Fixed buckets: those the instrument advises (as dropshot's request
+    /// duration histogram does, with the semantic conventions' boundaries),
+    /// else the OpenTelemetry SDK's defaults.  Suits values whose range is
+    /// known in advance.
+    Explicit,
+    /// Base-2 exponential buckets, whose resolution adapts to the range of
+    /// values measured.  Suits values spanning orders of magnitude; needs a
+    /// backend that supports exponential histograms.
+    Exponential,
+}
+
+/// Returns the default histogram aggregation, per the standard
+/// `OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION` variable
+/// (which the OpenTelemetry SDK doesn't itself read).  As the specification
+/// says, the default is explicit buckets, and an unrecognized value is
+/// ignored with a warning.
+fn default_histogram_aggregation() -> HistogramAggregation {
+    const NAME: &str =
+        "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION";
+    if env_unset(NAME) {
+        return HistogramAggregation::Explicit;
+    }
+    let value = std::env::var(NAME).unwrap();
+    match value.trim() {
+        "explicit_bucket_histogram" => HistogramAggregation::Explicit,
+        "base2_exponential_bucket_histogram" => {
+            HistogramAggregation::Exponential
+        }
+        _ => {
+            eprintln!(
+                "dropshot-otel: ignoring unsupported {NAME} value {value:?}"
+            );
+            HistogramAggregation::Explicit
+        }
+    }
+}
+
+/// The metrics view that chooses each histogram's aggregation: the one set
+/// for it by name, else the default.  (It's one view, not one per setting,
+/// because the SDK aggregates an instrument once for every view that
+/// matches it.)
+struct HistogramView {
+    default: HistogramAggregation,
+    /// Aggregations by lowercased instrument name.
+    overrides: HashMap<String, HistogramAggregation>,
+}
+
+impl HistogramView {
+    fn stream(&self, instrument: &Instrument) -> Option<Stream> {
+        if instrument.kind() != InstrumentKind::Histogram {
+            return None;
+        }
+        let aggregation = self
+            .overrides
+            .get(&instrument.name().to_lowercase())
+            .unwrap_or(&self.default);
+        match aggregation {
+            // Matching no view gives the SDK's default aggregation: explicit
+            // buckets, with the instrument's advised boundaries if any.
+            HistogramAggregation::Explicit => None,
+            HistogramAggregation::Exponential => Some(
+                Stream::builder()
+                    // The specification's default size limits: at most 160
+                    // buckets, at the finest scale that fits them.
+                    .with_aggregation(Aggregation::Base2ExponentialHistogram {
+                        max_size: 160,
+                        max_scale: 20,
+                        record_min_max: true,
+                    })
+                    .build()
+                    // Building fails only for an invalid unit or cardinality
+                    // limit, and this sets neither.
+                    .expect("valid exponential histogram stream"),
+            ),
+        }
+    }
+}
+
 /// Returns true if the named environment variable is unset or empty (the
 /// OpenTelemetry spec treats empty as unset).
 fn env_unset(name: &str) -> bool {
@@ -500,12 +619,12 @@ mod test {
         ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9");
 
     /// Runs `test::{name}` in a child process whose environment has no
-    /// `OTEL_*` or `RUST_LOG` variables except those in `env`, and asserts
-    /// that it ran and passed.
-    fn run_child(name: &str, env: &[(&str, &str)]) {
+    /// `OTEL_*` or `RUST_LOG` variables except those in `env`, asserts that
+    /// it ran and passed, and returns its standard error.
+    fn run_child(name: &str, env: &[(&str, &str)]) -> String {
         let mut cmd =
             std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.arg(format!("test::{}", name)).arg("--exact");
+        cmd.arg(format!("test::{}", name)).arg("--exact").arg("--nocapture");
         for (key, _) in std::env::vars_os() {
             let key = key.to_string_lossy();
             if key.starts_with("OTEL_") || key == "RUST_LOG" {
@@ -524,6 +643,7 @@ mod test {
             stdout,
             stderr
         );
+        stderr.into_owned()
     }
 
     fn is_child() -> bool {
@@ -940,6 +1060,153 @@ mod test {
         assert!(!global_subscriber_free());
         serve_one_request();
         assert_eq!(*completed.lock().unwrap(), [200]);
+    }
+
+    #[test]
+    fn test_default_histogram_aggregation() {
+        const NAME: &str =
+            "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION";
+        // As the specification says: explicit buckets unless configured
+        // otherwise, and an unrecognized setting is ignored with a warning.
+        for (value, expected) in [
+            (None, "Explicit"),
+            (Some(""), "Explicit"),
+            (Some("explicit_bucket_histogram"), "Explicit"),
+            (Some("base2_exponential_bucket_histogram"), "Exponential"),
+            (Some("summary"), "Explicit"),
+        ] {
+            let mut env = vec![(EXPECT_ENV, expected)];
+            env.extend(value.map(|value| (NAME, value)));
+            let stderr = run_child("child_default_histogram_aggregation", &env);
+            assert_eq!(
+                stderr.contains("dropshot-otel: ignoring unsupported"),
+                value == Some("summary"),
+                "{:?}: {}",
+                value,
+                stderr
+            );
+        }
+    }
+
+    #[test]
+    fn child_default_histogram_aggregation() {
+        if !is_child() {
+            return;
+        }
+        let expected = std::env::var(EXPECT_ENV).unwrap();
+        assert_eq!(
+            format!("{:?}", super::default_histogram_aggregation()),
+            expected
+        );
+    }
+
+    /// Returns the aggregation that `view` gives each of a few instruments:
+    /// histograms named `a` and `B` (with advised boundaries), and a
+    /// counter.
+    fn aggregations(
+        view: super::HistogramView,
+    ) -> std::collections::BTreeMap<String, String> {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+
+        let exporter =
+            opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .with_view(move |instrument: &_| view.stream(instrument))
+            .build();
+        let meter = provider.meter("test");
+        for name in ["a", "B"] {
+            let histogram = meter
+                .f64_histogram(name)
+                .with_boundaries(vec![1.0, 10.0])
+                .build();
+            histogram.record(0.5, &[]);
+        }
+        meter.u64_counter("requests").build().add(4, &[]);
+        provider.force_flush().unwrap();
+
+        exporter
+            .get_finished_metrics()
+            .unwrap()
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .map(|metric| {
+                let aggregation = match metric.data() {
+                    AggregatedMetrics::F64(MetricData::Histogram(h)) => {
+                        let point = h.data_points().next().unwrap();
+                        format!(
+                            "explicit {:?}",
+                            point.bounds().collect::<Vec<_>>()
+                        )
+                    }
+                    AggregatedMetrics::F64(
+                        MetricData::ExponentialHistogram(_),
+                    ) => "exponential".to_string(),
+                    AggregatedMetrics::U64(MetricData::Sum(_)) => {
+                        "sum".to_string()
+                    }
+                    other => format!("{:?}", other),
+                };
+                (metric.name().to_string(), aggregation)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_with_histogram_aggregation() {
+        use super::HistogramAggregation::{Explicit, Exponential};
+
+        let builder = super::builder("test")
+            .with_histogram_aggregation("Payload.Size", Explicit)
+            // A later setting for the same instrument wins.
+            .with_histogram_aggregation("payload.size", Exponential);
+        assert_eq!(
+            builder.histogram_aggregations,
+            [("payload.size".to_string(), Exponential)].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn test_histogram_view() {
+        use super::HistogramAggregation::{Explicit, Exponential};
+
+        // Explicit histograms keep their advised boundaries; overrides match
+        // instrument names case-insensitively; other kinds of instrument are
+        // unaffected.
+        let view = super::HistogramView {
+            default: Explicit,
+            overrides: [("b".to_string(), Exponential)].into_iter().collect(),
+        };
+        assert_eq!(
+            aggregations(view),
+            [
+                ("B", "exponential"),
+                ("a", "explicit [1.0, 10.0]"),
+                ("requests", "sum"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into_iter()
+            .collect()
+        );
+
+        let view = super::HistogramView {
+            default: Exponential,
+            // Keys are lowercased (by `Builder::with_histogram_aggregation`).
+            overrides: [("a".to_string(), Explicit)].into_iter().collect(),
+        };
+        assert_eq!(
+            aggregations(view),
+            [
+                ("B", "exponential"),
+                ("a", "explicit [1.0, 10.0]"),
+                ("requests", "sum"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into_iter()
+            .collect()
+        );
     }
 
     #[test]
