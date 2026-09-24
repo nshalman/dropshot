@@ -11,7 +11,15 @@
 //!
 //! The layer only gathers the numbers; what to do with them (histograms,
 //! counters, an export pipeline) is up to the function it is given.
+//! [`crate::Builder::install`] uses it to export the standard
+//! `http.server.request.duration` metric via OTLP, and
+//! [`crate::Builder::with_request_metrics`] passes each request to the
+//! application as well.
 
+use opentelemetry::KeyValue;
+use opentelemetry::Value;
+use opentelemetry::metrics::Histogram;
+use opentelemetry::metrics::Meter;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
@@ -189,6 +197,64 @@ pub fn label(key: impl Into<String>, value: impl Into<String>) {
     });
 }
 
+/// Records completed requests in the OpenTelemetry semantic conventions'
+/// `http.server.request.duration` histogram, which [`crate::Builder::install`]
+/// exports when metrics export is configured.
+///
+/// Each request's attributes are the conventions' standard ones, except the
+/// opt-in `server.address` and `server.port` (which come from request headers,
+/// so a client could use them to create unbounded numbers of series), plus
+/// the request's [`label`]s.  A label whose key is one of the standard
+/// attributes is ignored.
+pub(crate) struct DurationHistogram(Histogram<f64>);
+
+impl DurationHistogram {
+    pub(crate) fn new(meter: &Meter) -> Self {
+        DurationHistogram(
+            meter
+                .f64_histogram("http.server.request.duration")
+                .with_unit("s")
+                .with_description("Duration of HTTP server requests.")
+                // The semantic conventions' advised bucket boundaries.
+                .with_boundaries(vec![
+                    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0,
+                    2.5, 5.0, 7.5, 10.0,
+                ])
+                .build(),
+        )
+    }
+
+    pub(crate) fn record(&self, request: &CompletedRequest) {
+        let mut attributes = vec![
+            KeyValue::new("http.request.method", request.method.clone()),
+            KeyValue::new("url.scheme", request.url_scheme.clone()),
+        ];
+        let optional = [
+            ("error.type", request.error_type.clone().map(Value::from)),
+            (
+                "http.response.status_code",
+                request.status_code.map(|code| Value::from(i64::from(code))),
+            ),
+            ("http.route", request.route.clone().map(Value::from)),
+            (
+                "network.protocol.version",
+                request.protocol_version.clone().map(Value::from),
+            ),
+        ];
+        for (key, value) in optional {
+            if let Some(value) = value {
+                attributes.push(KeyValue::new(key, value));
+            }
+        }
+        for (key, value) in &request.labels {
+            if !attributes.iter().any(|kv| kv.key.as_str() == key) {
+                attributes.push(KeyValue::new(key.clone(), value.clone()));
+            }
+        }
+        self.0.record(request.duration.as_secs_f64(), &attributes);
+    }
+}
+
 /// Returns whether `metadata` describes a dropshot request span.
 fn is_request_span(metadata: &Metadata<'_>) -> bool {
     metadata.target() == "dropshot::instrument"
@@ -223,5 +289,125 @@ impl Visit for CompletedRequest {
 
     fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {
         // None of the fields we report are recorded as `Debug` values.
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::CompletedRequest;
+    use super::DurationHistogram;
+    use opentelemetry::KeyValue;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
+    use std::time::Duration;
+
+    #[test]
+    fn test_duration_histogram() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let histogram = DurationHistogram::new(&provider.meter("test"));
+
+        let mut ok = CompletedRequest {
+            method: "GET".to_string(),
+            url_path: "/items/1".to_string(),
+            url_scheme: "http".to_string(),
+            protocol_version: Some("1.1".to_string()),
+            server_address: Some("localhost".to_string()),
+            server_port: Some(8080),
+            route: Some("/items/{id}".to_string()),
+            operation_id: Some("get_item".to_string()),
+            status_code: Some(200),
+            error_type: None,
+            duration: Duration::from_millis(30),
+            labels: Default::default(),
+        };
+        ok.labels.insert("tenant".to_string(), "acme".to_string());
+        // Labels can't override the standard attributes.
+        ok.labels.insert("http.route".to_string(), "/elsewhere".to_string());
+        histogram.record(&ok);
+        let disconnected = CompletedRequest {
+            method: "_OTHER".to_string(),
+            url_path: "/hang".to_string(),
+            url_scheme: "https".to_string(),
+            error_type: Some("client_disconnect".to_string()),
+            duration: Duration::from_secs(2),
+            ..Default::default()
+        };
+        histogram.record(&disconnected);
+        provider.force_flush().unwrap();
+
+        let metrics = exporter.get_finished_metrics().unwrap();
+        let metric = metrics
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .find(|m| m.name() == "http.server.request.duration")
+            .expect("no http.server.request.duration metric");
+        assert_eq!(metric.unit(), "s");
+        let AggregatedMetrics::F64(MetricData::Histogram(histogram)) =
+            metric.data()
+        else {
+            panic!("not an f64 histogram: {:?}", metric.data());
+        };
+        let points: Vec<_> = histogram
+            .data_points()
+            .map(|point| {
+                let mut attributes: Vec<KeyValue> =
+                    point.attributes().cloned().collect();
+                attributes.sort_by(|a, b| a.key.cmp(&b.key));
+                (attributes, point)
+            })
+            .collect();
+        assert_eq!(points.len(), 2, "{:#?}", histogram);
+        let find = |method: &str| {
+            points
+                .iter()
+                .find(|(attributes, _)| {
+                    attributes.contains(&KeyValue::new(
+                        "http.request.method",
+                        method.to_string(),
+                    ))
+                })
+                .unwrap_or_else(|| panic!("no data point for {}", method))
+        };
+
+        let (attributes, point) = find("GET");
+        assert_eq!(
+            *attributes,
+            [
+                KeyValue::new("http.request.method", "GET"),
+                KeyValue::new("http.response.status_code", 200),
+                KeyValue::new("http.route", "/items/{id}"),
+                KeyValue::new("network.protocol.version", "1.1"),
+                KeyValue::new("tenant", "acme"),
+                KeyValue::new("url.scheme", "http"),
+            ]
+        );
+        assert_eq!(point.count(), 1);
+        assert!((point.sum() - 0.030).abs() < 1e-9, "{}", point.sum());
+        assert_eq!(
+            point.bounds().collect::<Vec<_>>(),
+            [
+                0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0,
+                2.5, 5.0, 7.5, 10.0
+            ]
+        );
+
+        let (attributes, point) = find("_OTHER");
+        assert_eq!(
+            *attributes,
+            [
+                KeyValue::new("error.type", "client_disconnect"),
+                KeyValue::new("http.request.method", "_OTHER"),
+                KeyValue::new("url.scheme", "https"),
+            ]
+        );
+        assert_eq!(point.count(), 1);
+        assert!((point.sum() - 2.0).abs() < 1e-9, "{}", point.sum());
     }
 }

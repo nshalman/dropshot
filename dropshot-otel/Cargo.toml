@@ -1,6 +1,6 @@
 [package]
 name = "dropshot-otel"
-description = "opinionated OpenTelemetry tracing setup for Dropshot servers"
+description = "opinionated OpenTelemetry setup for Dropshot servers"
 version = "0.1.0"
 authors = ["Nahum Shalman <nahamu@gmail.com>"]
 edition.workspace = true
@@ -14,9 +14,9 @@ categories = ["development-tools::debugging", "network-programming"]
 workspace = true
 
 [dependencies]
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "internal-logs"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "trace", "http-proto", "reqwest-blocking-client", "internal-logs"] }
 slog = "2.8.2"
 thiserror = "2.0.18"
 tracing = "0.1.44"
@@ -24,16 +24,16 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "registry", "std"] }
 
 [features]
-# The OTLP exporter speaks HTTP; the `tls` feature lets it also speak HTTPS,
+# The OTLP exporters speak HTTP; the `tls` feature lets them also speak HTTPS,
 # using rustls with the aws-lc-rs crypto provider (matching dropshot's own
 # TLS stack) and the platform's certificate verifier.  Build with
-# default-features = false for a plain-HTTP-only exporter.
+# default-features = false for plain-HTTP-only exporters.
 default = ["tls"]
 tls = ["opentelemetry-otlp/reqwest-rustls"]
 
 [dev-dependencies]
 dropshot = { version = "^0.17.1", path = "../dropshot", features = ["tracing"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "testing"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "trace", "testing"] }
 reqwest = { version = "0.13.4", default-features = false }
 schemars = "0.8.22"
 serde = { version = "1.0.228", features = ["derive"] }

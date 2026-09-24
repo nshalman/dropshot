@@ -1,5 +1,5 @@
 // Copyright 2026 Oxide Computer Company
-//! Opinionated OpenTelemetry tracing setup for [Dropshot] servers.
+//! Opinionated OpenTelemetry setup for [Dropshot] servers.
 //!
 //! Dropshot's optional `tracing` feature makes the server create one
 //! [`tracing::Span`] per request and record a documented set of fields on it
@@ -8,8 +8,9 @@
 //! Dropshot itself has no opinion about what consumes those spans.  This
 //! crate is one such consumer: it wires up the `tracing` machinery to export
 //! the spans via OTLP, propagate W3C trace context from incoming requests,
-//! and (optionally) forward `tracing` events into an existing `slog` logger
-//! and report per-request [`metrics`].
+//! export the standard HTTP server request duration metric via OTLP, and
+//! (optionally) forward `tracing` events into an existing `slog` logger and
+//! report per-request [`metrics`] to application code.
 //!
 //! # Usage
 //!
@@ -26,24 +27,38 @@
 //! ```
 //!
 //! Keep the returned [`Guard`] alive for the lifetime of the process;
-//! dropping it flushes buffered spans and shuts down the exporter.
+//! dropping it flushes buffered spans and metrics and shuts down the
+//! exporters.
 //!
 //! # Configuration
 //!
 //! Exporting is controlled by the standard OpenTelemetry environment
 //! variables, read by the OpenTelemetry SDK and OTLP exporter
 //! (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
-//! `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_SERVICE_NAME`,
+//! `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
+//! `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_SERVICE_NAME`,
 //! `OTEL_RESOURCE_ATTRIBUTES`, and friends).  This crate reads the
 //! environment but never modifies it.  Its own behaviors worth knowing:
 //!
-//! * No exporter is created, and spans go nowhere, if neither
-//!   `OTEL_EXPORTER_OTLP_ENDPOINT` nor `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
-//!   is set, if `OTEL_SDK_DISABLED` is `true`, or if `OTEL_TRACES_EXPORTER`
-//!   is `none`.  (The slog bridge, if requested, still works.)
+//! * Traces and metrics are exported independently.  No trace exporter is
+//!   created, and spans go nowhere, if neither `OTEL_EXPORTER_OTLP_ENDPOINT`
+//!   nor `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set, if `OTEL_SDK_DISABLED`
+//!   is `true`, or if `OTEL_TRACES_EXPORTER` is `none`; likewise for metrics,
+//!   with `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and `OTEL_METRICS_EXPORTER`.
+//!   (The slog bridge and [`Builder::with_request_metrics`], if requested,
+//!   still work.)  So a collector that accepts only traces needs
+//!   `OTEL_METRICS_EXPORTER=none`.
 //! * The only supported OTLP protocol is `http/protobuf`; [`Builder::install`]
-//!   fails if `OTEL_EXPORTER_OTLP_PROTOCOL` or
-//!   `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` asks for another.
+//!   fails if `OTEL_EXPORTER_OTLP_PROTOCOL`,
+//!   `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, or
+//!   `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` asks for another.
+//! * The exported metric is the OpenTelemetry semantic conventions'
+//!   `http.server.request.duration` histogram, recorded for every request
+//!   dropshot handles.  Its attributes are the conventions' standard ones
+//!   (method, scheme, route, status code, error type, protocol version)
+//!   except for the opt-in `server.address` and `server.port`, plus any
+//!   [`metrics::label`]s.  Installing also sets the global OpenTelemetry
+//!   meter provider, for the application's own metrics.
 //! * If neither `OTEL_SERVICE_NAME` nor a `service.name` in
 //!   `OTEL_RESOURCE_ATTRIBUTES` is set, the service name passed to
 //!   [`builder`] is used.
@@ -56,10 +71,10 @@
 //! exported.  It does not affect request metrics
 //! ([`Builder::with_request_metrics`]).
 //!
-//! The exporter speaks OTLP over HTTP.  With the default `tls` cargo feature
-//! it can also speak HTTPS, using rustls with the aws-lc-rs provider (the
+//! The exporters speak OTLP over HTTP.  With the default `tls` cargo feature
+//! they can also speak HTTPS, using rustls with the aws-lc-rs provider (the
 //! same TLS stack dropshot uses) and the platform certificate store; build
-//! with `default-features = false` for a plain-HTTP-only exporter.
+//! with `default-features = false` for plain-HTTP-only exporters.
 //!
 //! [Dropshot]: https://docs.rs/dropshot
 
@@ -70,9 +85,11 @@ mod slog_bridge;
 pub use propagation::TraceContextLayer;
 pub use slog_bridge::SlogBridge;
 
+use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::resource::{EnvResourceDetector, ResourceDetector};
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
@@ -113,7 +130,7 @@ pub struct Builder {
 /// Errors from [`Builder::install`].
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
-    #[error("failed to build the OTLP span exporter: {0}")]
+    #[error("failed to build an OTLP exporter: {0}")]
     Exporter(#[from] opentelemetry_otlp::ExporterBuildError),
     #[error("a global tracing subscriber is already installed")]
     SubscriberAlreadySet(#[from] tracing::subscriber::SetGlobalDefaultError),
@@ -189,6 +206,9 @@ impl Builder {
     /// Reports every request dropshot handles to `recorder`, as it completes;
     /// see [`metrics`].  Unlike span export and the slog bridge, this does
     /// not depend on `RUST_LOG`.
+    ///
+    /// This is for applications that want their own view of requests; the
+    /// OTLP metrics export described in the crate docs needs no recorder.
     pub fn with_request_metrics(
         mut self,
         recorder: impl Fn(&metrics::CompletedRequest) + Send + Sync + 'static,
@@ -198,20 +218,23 @@ impl Builder {
     }
 
     /// Installs the global `tracing` subscriber and, if an OTLP endpoint is
-    /// configured in the environment, the OpenTelemetry export pipeline.
+    /// configured in the environment, the OpenTelemetry export pipelines.
     ///
-    /// If there is nothing to do — no OTLP endpoint configured, and neither
-    /// the slog bridge nor request metrics requested — this installs nothing
-    /// and returns an inert [`Guard`], leaving the global subscriber slot
-    /// free for other use.
+    /// If there is nothing to do — neither traces nor metrics to export, and
+    /// neither the slog bridge nor request metrics requested — this installs
+    /// nothing and returns an inert [`Guard`], leaving the global subscriber
+    /// slot free for other use.
     pub fn install(self) -> Result<Guard, InitError> {
-        let export = export_enabled("TRACES")?;
-        if !export
+        let export_traces = export_enabled("TRACES")?;
+        let export_metrics = export_enabled("METRICS")?;
+        if !export_traces
+            && !export_metrics
             && self.slog_logger.is_none()
             && self.request_metrics.is_none()
         {
-            return Ok(Guard { provider: None });
+            return Ok(Guard { tracer_provider: None, meter_provider: None });
         }
+        let resource = resource(self.service_name);
 
         // `RUST_LOG` filters each layer that honors it, rather than the whole
         // subscriber, so that it cannot stop request metrics.  (`EnvFilter`
@@ -221,12 +244,12 @@ impl Builder {
                 .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
         };
 
-        let (otel_layer, provider) = if export {
+        let (otel_layer, tracer_provider) = if export_traces {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
                 .build()?;
             let provider = SdkTracerProvider::builder()
-                .with_resource(resource(self.service_name))
+                .with_resource(resource.clone())
                 .with_batch_exporter(ScrubbingExporter {
                     inner: exporter,
                     scrubber: self.scrubber,
@@ -245,9 +268,33 @@ impl Builder {
         let bridge = self
             .slog_logger
             .map(|logger| SlogBridge::new(logger).with_filter(filter()));
-        let request_metrics = self
-            .request_metrics
-            .map(|RequestRecorder(recorder)| metrics::layer(recorder));
+        let meter_provider = if export_metrics {
+            let exporter = opentelemetry_otlp::MetricExporter::builder()
+                .with_http()
+                .build()?;
+            Some(
+                SdkMeterProvider::builder()
+                    .with_resource(resource)
+                    .with_periodic_exporter(exporter)
+                    .build(),
+            )
+        } else {
+            None
+        };
+        let duration_histogram = meter_provider.as_ref().map(|provider| {
+            metrics::DurationHistogram::new(&provider.meter("dropshot-otel"))
+        });
+        let request_metrics = match (self.request_metrics, duration_histogram) {
+            (None, None) => None,
+            (recorder, histogram) => Some(metrics::layer(move |request| {
+                if let Some(RequestRecorder(recorder)) = &recorder {
+                    recorder(request);
+                }
+                if let Some(histogram) = &histogram {
+                    histogram.record(request);
+                }
+            })),
+        };
         let subscriber =
             tracing_subscriber::registry().with(bridge).with(request_metrics);
         // Not `.with(otel_layer)`: `Option<Layer>` doesn't pass
@@ -262,31 +309,41 @@ impl Builder {
         // leaves no global state behind.  The layer does its own propagation
         // of incoming trace context; the global propagator is for application
         // code propagating it onward (e.g. into outgoing requests).
-        if let Some(provider) = &provider {
+        if let Some(provider) = &tracer_provider {
             opentelemetry::global::set_tracer_provider(provider.clone());
             opentelemetry::global::set_text_map_propagator(
                 TraceContextPropagator::new(),
             );
         }
-        Ok(Guard { provider })
+        // For application code's own metrics.
+        if let Some(provider) = &meter_provider {
+            opentelemetry::global::set_meter_provider(provider.clone());
+        }
+        Ok(Guard { tracer_provider, meter_provider })
     }
 }
 
 /// Keeps the OpenTelemetry export pipeline alive.  Dropping the guard flushes
-/// buffered spans and shuts down the exporter, so hold it for the life of the
-/// process (e.g. `let _guard = ...` in `main`).
+/// buffered spans and metrics and shuts down the exporters, so hold it for the
+/// life of the process (e.g. `let _guard = ...` in `main`).
 #[derive(Debug)]
-#[must_use = "dropping the Guard shuts down span export"]
+#[must_use = "dropping the Guard shuts down export"]
 pub struct Guard {
-    provider: Option<SdkTracerProvider>,
+    tracer_provider: Option<SdkTracerProvider>,
+    meter_provider: Option<SdkMeterProvider>,
 }
 
 impl Guard {
-    /// Synchronously flushes any buffered spans to the exporter.
+    /// Synchronously flushes any buffered spans and metrics to the exporters.
     pub fn force_flush(&self) {
-        if let Some(provider) = &self.provider {
+        if let Some(provider) = &self.tracer_provider {
             if let Err(e) = provider.force_flush() {
                 eprintln!("dropshot-otel: failed to flush spans: {e}");
+            }
+        }
+        if let Some(provider) = &self.meter_provider {
+            if let Err(e) = provider.force_flush() {
+                eprintln!("dropshot-otel: failed to flush metrics: {e}");
             }
         }
     }
@@ -294,11 +351,19 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Some(provider) = self.provider.take() {
+        if let Some(provider) = self.tracer_provider.take() {
             // Shutdown drains the batch processor's queue before returning.
             if let Err(e) = provider.shutdown() {
                 eprintln!(
                     "dropshot-otel: failed to shut down tracer provider: {e}"
+                );
+            }
+        }
+        if let Some(provider) = self.meter_provider.take() {
+            // Shutdown exports what has been collected since the last export.
+            if let Err(e) = provider.shutdown() {
+                eprintln!(
+                    "dropshot-otel: failed to shut down meter provider: {e}"
                 );
             }
         }
@@ -498,8 +563,9 @@ mod test {
 
     #[test]
     fn test_install_honors_traces_exporter_none() {
+        // Metrics are still exported, so a subscriber is installed.
         run_child(
-            "child_installs_nothing",
+            "child_installs_without_tracer",
             &[ENDPOINT, ("OTEL_TRACES_EXPORTER", "none")],
         );
     }
@@ -507,19 +573,32 @@ mod test {
     #[test]
     fn test_install_honors_traces_exporter_none_in_any_case() {
         run_child(
-            "child_installs_nothing",
+            "child_installs_without_tracer",
             &[ENDPOINT, ("OTEL_TRACES_EXPORTER", "NONE")],
         );
     }
 
     #[test]
+    fn test_install_with_all_exporters_none() {
+        run_child(
+            "child_installs_nothing",
+            &[
+                ENDPOINT,
+                ("OTEL_TRACES_EXPORTER", "none"),
+                ("OTEL_METRICS_EXPORTER", "none"),
+            ],
+        );
+    }
+
+    #[test]
     fn test_install_protocol_precedence() {
-        // The traces-specific setting wins over the general one.
+        // The signal-specific settings win over the general one.
         run_child(
             "child_installs",
             &[
                 ENDPOINT,
                 ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
+                ("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "http/protobuf"),
                 ("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
             ],
         );
@@ -540,6 +619,10 @@ mod test {
             "child_unsupported_protocol",
             &[ENDPOINT, ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "grpc")],
         );
+        run_child(
+            "child_unsupported_protocol",
+            &[ENDPOINT, ("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", "grpc")],
+        );
     }
 
     #[test]
@@ -549,6 +632,16 @@ mod test {
         }
         let _guard = super::builder("test").install().unwrap();
         assert!(global_tracer_installed());
+        assert!(!global_subscriber_free());
+    }
+
+    #[test]
+    fn child_installs_without_tracer() {
+        if !is_child() {
+            return;
+        }
+        let _guard = super::builder("test").install().unwrap();
+        assert!(!global_tracer_installed());
         assert!(!global_subscriber_free());
     }
 
@@ -715,8 +808,12 @@ mod test {
         }
     }
 
+    /// The name of the request duration metric, which appears in exported
+    /// metrics.
+    const DURATION_METRIC: &str = "http.server.request.duration";
+
     #[test]
-    fn test_install_exports_request_spans() {
+    fn test_install_exports_request_spans_and_metrics() {
         let (endpoint, received) = start_otlp_sink();
         run_child(
             "child_serves_one_request",
@@ -724,6 +821,9 @@ mod test {
         );
         // Exported, and named for the endpoint (by TraceContextLayer).
         assert!(sent(&received, "/v1/traces", "GET /ping"));
+        // The route is one of the metric's attributes.
+        assert!(sent(&received, "/v1/metrics", DURATION_METRIC));
+        assert!(sent(&received, "/v1/metrics", "/ping"));
     }
 
     #[test]
@@ -734,6 +834,46 @@ mod test {
             &[("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint), ("RUST_LOG", "warn")],
         );
         assert!(!sent(&received, "/v1/traces", "/ping"));
+        // Metrics don't depend on RUST_LOG.
+        assert!(sent(&received, "/v1/metrics", DURATION_METRIC));
+    }
+
+    #[test]
+    fn test_install_exports_each_signal_independently() {
+        let (endpoint, received) = start_otlp_sink();
+        run_child(
+            "child_serves_one_request",
+            &[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+                ("OTEL_METRICS_EXPORTER", "none"),
+            ],
+        );
+        assert!(sent(&received, "/v1/traces", "GET /ping"));
+        assert!(!sent(&received, "/v1/metrics", DURATION_METRIC));
+
+        let (endpoint, received) = start_otlp_sink();
+        run_child(
+            "child_serves_one_request",
+            &[
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint),
+                ("OTEL_TRACES_EXPORTER", "none"),
+            ],
+        );
+        assert!(!sent(&received, "/v1/traces", "/ping"));
+        assert!(sent(&received, "/v1/metrics", DURATION_METRIC));
+
+        // A signal-specific endpoint is used as given, and applies only to
+        // that signal.
+        let (endpoint, received) = start_otlp_sink();
+        run_child(
+            "child_serves_one_request",
+            &[(
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                &format!("{}/custom/metrics", endpoint),
+            )],
+        );
+        assert!(!sent(&received, "/v1/traces", "/ping"));
+        assert!(sent(&received, "/custom/metrics", DURATION_METRIC));
     }
 
     #[test]

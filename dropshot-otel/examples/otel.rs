@@ -13,7 +13,9 @@
 //! ```
 //!
 //! Each request appears as a trace; the second joins the trace given in its
-//! `traceparent` header.  Query parameters named in `SENSITIVE_PARAMS` are
+//! `traceparent` header.  Request durations are also exported, as the
+//! `http.server.request.duration` metric, once a minute and on exit (set
+//! `OTEL_METRICS_EXPORTER=none` if the collector doesn't accept metrics).  Query parameters named in `SENSITIVE_PARAMS` are
 //! redacted before export: after
 //!
 //! ```bash
@@ -50,9 +52,9 @@ async fn main() -> Result<(), String> {
         .to_logger("example-otel")
         .map_err(|error| format!("failed to create logger: {}", error))?;
 
-    // Install the OpenTelemetry export pipeline (if configured in the
+    // Install the OpenTelemetry export pipelines (if configured in the
     // environment) and forward tracing events to our slog logger.  The
-    // guard flushes and shuts down the exporter when dropped.
+    // guard flushes and shuts down the exporters when dropped.
     let _guard = dropshot_otel::builder("dropshot-otel-example")
         .with_slog_bridge(log.clone())
         .with_span_scrubber(scrub_span)
@@ -74,7 +76,7 @@ async fn main() -> Result<(), String> {
 
     // Run until the server fails or we're interrupted.  Either way, return
     // (rather than dying by signal) so that `_guard` is dropped and flushes
-    // buffered spans.
+    // buffered spans and metrics.
     tokio::select! {
         result = server => result,
         _ = tokio::signal::ctrl_c() => Ok(()),
